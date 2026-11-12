@@ -226,3 +226,58 @@ fn network_completion_releases_children_at_the_revised_finish_time() {
     close(events[0].1, 2.0);
     close(events[1].1, 11.0);
 }
+
+#[derive(Clone, Default)]
+struct TraceBuffer(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+impl std::io::Write for TraceBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn graph_trace_records_network_repolls_and_future_completion() {
+    let trace = TraceBuffer::default();
+    let mut graph = Graph::with_trace(trace.clone());
+    let mut net = Box::new(BadPoll(2.0));
+    graph.add_network_node(&mut *net, 0, 1, 1024);
+    Engine::new(graph, Box::<Recorder>::default())
+        .run()
+        .unwrap();
+    let bytes = trace.0.borrow();
+    let rows: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let pending = rows
+        .iter()
+        .find(|r| r["event"] == "network_pending")
+        .unwrap();
+    assert_eq!(pending["next_poll_s"], 2.0);
+    assert_eq!(rows.iter().filter(|r| r["event"] == "dispatch").count(), 2);
+    let done = rows.iter().find(|r| r["event"] == "node_complete").unwrap();
+    assert_eq!(done["finish_s"], 2.0);
+    assert_eq!(rows[1]["details"]["bytes"], 1024);
+}
+
+#[test]
+fn graph_trace_write_errors_fail_the_run() {
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("trace disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let error = Engine::new(Graph::with_trace(Broken), Box::<Recorder>::default())
+        .run()
+        .unwrap_err();
+    assert!(error.to_string().contains("trace disk full"));
+}

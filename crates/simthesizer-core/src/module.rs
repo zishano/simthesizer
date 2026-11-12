@@ -18,6 +18,11 @@ pub trait Module {
 }
 
 pub trait LogicalHandler {
+    /// Optional human-readable payload description for graph tracing.
+    fn describe(&self, _payload: &dyn Any) -> String {
+        std::any::type_name::<Self>().to_owned()
+    }
+
     fn handle(
         &mut self,
         payload: Box<dyn Any>,

@@ -1,6 +1,8 @@
+use serde_json::{json, Value};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::io::Write;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -15,6 +17,15 @@ use crate::types::{
 pub struct Graph {
     next_node_id: NodeID,
     nodes: HashMap<NodeID, Node>,
+    trace: Option<GraphTrace>,
+    clock: f64,
+    current: Option<NodeID>,
+}
+
+struct GraphTrace {
+    writer: Box<dyn Write>,
+    error: Option<std::io::Error>,
+    sequence: u64,
 }
 
 pub struct Engine {
@@ -73,7 +84,52 @@ impl Graph {
         Self {
             next_node_id: 0,
             nodes: HashMap::new(),
+            trace: None,
+            clock: 0.0,
+            current: None,
         }
+    }
+
+    /// Attach before seeding requests to capture the complete graph history.
+    pub fn with_trace(writer: impl Write + 'static) -> Self {
+        let mut graph = Self::new();
+        graph.trace = Some(GraphTrace {
+            writer: Box::new(writer),
+            error: None,
+            sequence: 0,
+        });
+        graph.record(json!({"event":"header", "version":1, "time_unit":"seconds"}));
+        graph
+    }
+
+    fn record(&mut self, mut event: Value) {
+        if let Some(trace) = &mut self.trace {
+            if trace.error.is_some() {
+                return;
+            }
+            event["seq"] = json!(trace.sequence);
+            event["time_s"] = json!(self.clock);
+            event["cause"] = json!(self.current);
+            trace.sequence += 1;
+            let result = serde_json::to_writer(&mut trace.writer, &event)
+                .map_err(std::io::Error::other)
+                .and_then(|_| trace.writer.write_all(b"\n"));
+            if let Err(error) = result {
+                trace.error = Some(error);
+            }
+        }
+    }
+
+    fn check_trace(&mut self, flush: bool) -> Result<()> {
+        if let Some(trace) = &mut self.trace {
+            if let Some(error) = trace.error.take() {
+                return Err(error.into());
+            }
+            if flush {
+                trace.writer.flush()?;
+            }
+        }
+        Ok(())
     }
 
     pub fn add_compute_node(
@@ -148,16 +204,19 @@ impl Graph {
             .get_mut(&child)
             .ok_or_else(|| anyhow!("node {child} disappeared during edge insertion"))?
             .indegree += 1;
+        if self.trace.is_some() {
+            self.record(json!({"event":"edge_add", "parent":parent, "child":child}));
+        }
         Ok(())
     }
 
     pub fn pop_edges(&mut self, parent: NodeID) -> Result<Vec<NodeID>> {
         self.ensure_node_exists(parent)?;
-        let parent = self
+        let parent_node = self
             .nodes
             .get_mut(&parent)
             .ok_or_else(|| anyhow!("node {parent} disappeared during edge removal"))?;
-        let children = std::mem::take(&mut parent.children);
+        let children = std::mem::take(&mut parent_node.children);
 
         for &child_id in &children {
             let child = self
@@ -170,6 +229,11 @@ impl Graph {
                 .ok_or_else(|| anyhow!("child node {child_id} indegree underflow"))?;
         }
 
+        if self.trace.is_some() {
+            for &child in &children {
+                self.record(json!({"event":"edge_remove", "parent":parent, "child":child}));
+            }
+        }
         Ok(children)
     }
 
@@ -191,6 +255,31 @@ impl Graph {
     fn insert_node(&mut self, kind: NodeKind, start_time: f64) -> NodeID {
         let node_id = self.next_node_id;
         self.next_node_id += 1;
+        if self.trace.is_some() {
+            let details = match &kind {
+                NodeKind::Compute {
+                    layer,
+                    batch,
+                    context,
+                    ..
+                } => json!({
+                    "kind":"compute", "label":layer.name(), "layer":format!("{layer:?}"),
+                    "batch":batch.iter().map(|r| json!({"q_len":r.q_len,"kv_len":r.kv_len,"lm_head_len":r.lm_head_len})).collect::<Vec<_>>(),
+                    "context":format!("{context:?}")}),
+                NodeKind::Network {
+                    src, dst, bytes, ..
+                } => {
+                    json!({"kind":"network", "label":"transfer", "src":src,"dst":dst,"bytes":bytes})
+                }
+                NodeKind::Logical { handler, payload } => {
+                    // Same lifetime guarantee as event dispatch; description is read-only.
+                    let label =
+                        unsafe { (&**handler).describe(payload.as_ref().unwrap().as_ref()) };
+                    json!({"kind":"logical", "label":label})
+                }
+            };
+            self.record(json!({"event":"node_create", "node":node_id, "release_s":start_time, "details":details}));
+        }
         self.nodes.insert(
             node_id,
             Node {
@@ -226,12 +315,21 @@ impl Engine {
         mut self,
         mut observe: impl FnMut(f64, &dyn System) -> Result<()>,
     ) -> Result<Vec<RequestResult>> {
+        self.graph.check_trace(false)?;
         let mut queue = self.ready_queue()?;
         if queue.peek().is_none_or(|entry| entry.time > 0.0) {
             observe(0.0, self.system.as_ref())?;
         }
         while let Some(entry) = queue.pop() {
+            self.graph.clock = entry.time;
+            self.graph.current = Some(entry.node_id);
+            if self.graph.trace.is_some() {
+                self.graph
+                    .record(json!({"event":"dispatch", "node":entry.node_id}));
+            }
             self.process_entry(entry, &mut queue)?;
+            self.graph.current = None;
+            self.graph.check_trace(false)?;
             if queue.peek().is_none_or(|next| next.time != entry.time) {
                 observe(entry.time, self.system.as_ref())?;
             }
@@ -242,7 +340,12 @@ impl Engine {
                 self.graph.nodes.len()
             );
         }
-        self.system.into_results()
+        let results = self.system.into_results()?;
+        if self.graph.trace.is_some() {
+            self.graph.record(json!({"event":"run_complete"}));
+        }
+        self.graph.check_trace(true)?;
+        Ok(results)
     }
 
     fn ready_queue(&self) -> Result<BinaryHeap<QueueEntry>> {
@@ -365,6 +468,9 @@ impl Engine {
                 {
                     bail!("network poll must advance finite time, got delay {latency} at {start_time}");
                 }
+                if self.graph.trace.is_some() {
+                    self.graph.record(json!({"event":"network_pending", "node":entry.node_id, "next_poll_s":next_time}));
+                }
                 let node = self.graph.nodes.get_mut(&entry.node_id).ok_or_else(|| {
                     anyhow!("queued node {} disappeared during poll", entry.node_id)
                 })?;
@@ -423,6 +529,9 @@ impl Engine {
         let finish_time = start_time + latency;
         if !latency.is_finite() || latency < 0.0 || !finish_time.is_finite() {
             bail!("node {node_id} has invalid latency {latency} at {start_time}");
+        }
+        if self.graph.trace.is_some() {
+            self.graph.record(json!({"event":"node_complete", "node":node_id, "start_s":start_time, "finish_s":finish_time}));
         }
         let children = self
             .graph

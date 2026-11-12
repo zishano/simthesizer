@@ -74,6 +74,7 @@ fn default_router() -> Box<dyn Router> {
     Box::new(crate::routers::round_robin::RoundRobinRouter::default())
 }
 
+#[derive(Debug)]
 enum LogicalPayload {
     RequestArrival {
         request_id: u64,
@@ -240,6 +241,14 @@ impl MoeEpMultiInstanceSystem {
 }
 
 impl LogicalHandler for MoeEpMultiInstanceSystem {
+    fn describe(&self, payload: &dyn Any) -> String {
+        if let Some(value) = payload.downcast_ref::<LogicalPayload>() {
+            format!("{}::{value:?}", std::any::type_name::<Self>())
+        } else {
+            std::any::type_name::<Self>().to_owned()
+        }
+    }
+
     fn handle(
         &mut self,
         payload: Box<dyn Any>,

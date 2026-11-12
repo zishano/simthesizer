@@ -23,6 +23,9 @@ struct Args {
     /// Component state at the engine clock, as JSONL.
     #[arg(long)]
     output_engine_trace: Option<PathBuf>,
+    /// Complete dynamic graph event history, as JSONL.
+    #[arg(long)]
+    output_graph_trace: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +53,22 @@ fn main() -> Result<()> {
             "trace and result paths must differ"
         );
     }
+    args.output_graph_trace = args
+        .output_graph_trace
+        .as_deref()
+        .map(output_path)
+        .transpose()?;
+    if let Some(path) = &args.output_graph_trace {
+        anyhow::ensure!(
+            !path.exists(),
+            "graph trace already exists: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            path != &args.output_jsonl && Some(path) != args.output_engine_trace.as_ref(),
+            "graph trace, engine trace and result paths must differ"
+        );
+    }
     let config_path = args.config;
     let workload_path = args.workload;
     let mut config = load_config(&config_path)?;
@@ -59,7 +78,16 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     config.system.resolve_path(&system_base_path)?;
     config.system.init()?;
-    let mut graph = Graph::new();
+    let graph_file = args
+        .output_graph_trace
+        .as_ref()
+        .map(|path| tempfile::NamedTempFile::new_in(path.parent().unwrap()))
+        .transpose()?;
+    let mut graph = if let Some(file) = &graph_file {
+        Graph::with_trace(std::io::BufWriter::new(file.reopen()?))
+    } else {
+        Graph::new()
+    };
     load_workload(config.system.as_mut(), &mut graph, &workload_path)?;
 
     let engine = Engine::new(graph, config.system);
@@ -81,6 +109,9 @@ fn main() -> Result<()> {
     };
 
     write_results_jsonl(&args.output_jsonl, &results)?;
+    if let Some(file) = graph_file {
+        file.persist_noclobber(args.output_graph_trace.as_ref().unwrap())?;
+    }
 
     Ok(())
 }

@@ -40,6 +40,7 @@ pub struct MoeExpertParallelRunner {
 
 crate::register_model_runner!(MoeExpertParallelRunner, "moe_ep");
 
+#[derive(Debug)]
 enum LogicalPayload {
     BlockStart,
     FastForward { remaining_blocks: u32 },
@@ -520,6 +521,14 @@ impl Module for MoeExpertParallelRunner {
 }
 
 impl LogicalHandler for MoeExpertParallelRunner {
+    fn describe(&self, payload: &dyn Any) -> String {
+        if let Some(value) = payload.downcast_ref::<LogicalPayload>() {
+            format!("{}::{value:?}", std::any::type_name::<Self>())
+        } else {
+            std::any::type_name::<Self>().to_owned()
+        }
+    }
+
     fn handle(
         &mut self,
         payload: Box<dyn Any>,

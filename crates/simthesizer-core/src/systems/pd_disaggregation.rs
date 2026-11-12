@@ -64,6 +64,7 @@ struct LlmTokenData<'a> {
     output_token_ids: Option<&'a [u32]>,
 }
 
+#[derive(Debug)]
 enum LogicalPayload {
     TransferComplete { request_id: u64 },
 }
@@ -454,6 +455,14 @@ impl PdDisaggregationSystem {
 }
 
 impl LogicalHandler for PdDisaggregationSystem {
+    fn describe(&self, payload: &dyn Any) -> String {
+        if let Some(value) = payload.downcast_ref::<LogicalPayload>() {
+            format!("{}::{value:?}", std::any::type_name::<Self>())
+        } else {
+            std::any::type_name::<Self>().to_owned()
+        }
+    }
+
     fn handle(
         &mut self,
         payload: Box<dyn Any>,

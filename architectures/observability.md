@@ -59,3 +59,34 @@ fixed arrivals. This restriction belongs to the comparison contract. Engine
 observation itself supports nested systems and dependent requests. A reference
 with different component identities needs an explicit correspondence before
 pairing. See the [tool guide](../.agents/tools/validation.md) for commands.
+
+## Dynamic graph history
+
+`--output-graph-trace PATH` independently exports the complete event graph history
+as version-1 JSONL. Attach capture before workload seeding. Records cover node
+creation (compute batch shapes, logical descriptions, transfer endpoints/bytes),
+edge addition/removal, dispatch, network pending polls, node completion, and a
+successful run marker. `cause` identifies the dispatch that created or changed
+work. Logical handlers may supply read-only descriptions; other handlers retain
+their Rust type name. No process pointers are exported.
+
+`seq` orders graph operations; `time_s` is the dispatch clock, not necessarily the
+recorded node finish time. The engine resolves durations eagerly and deletes
+nodes before virtual time reaches their finish. `node_complete.start_s` is the
+current execution/poll start; for a polled transfer its first dispatch gives the
+transfer start. Removed edges remain historical changes, not execution
+constraints. Successful exports are flushed and published without overwriting
+an existing trace. Capture is opt-in and streams to disk.
+
+Render a self-contained browser replay with:
+
+```sh
+uv run --locked python scripts/draw_graph.py output/graph.jsonl --output output/graph.html
+```
+
+The viewer retains all nodes, pages them in creation order, and exposes cross-page
+dependencies and creation causes through clickable details. Replay follows graph
+operation order and shows simulated execution status using finish times. It
+preserves `FastForward` nodes rather than inventing unexpanded model layers.
+Graph tracing observes the current abstraction; it does not add missing
+communication, resource models, or simulator mechanisms.

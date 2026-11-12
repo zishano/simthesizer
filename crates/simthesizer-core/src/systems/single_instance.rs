@@ -61,6 +61,7 @@ impl ActiveRequest {
 
 crate::register_system!(SingleInstanceSystem, "single_instance");
 
+#[derive(Debug)]
 enum LogicalPayload {
     RequestArrival {
         request_id: u64,
@@ -206,6 +207,14 @@ impl SingleInstanceSystem {
 }
 
 impl LogicalHandler for SingleInstanceSystem {
+    fn describe(&self, payload: &dyn Any) -> String {
+        if let Some(value) = payload.downcast_ref::<LogicalPayload>() {
+            format!("{}::{value:?}", std::any::type_name::<Self>())
+        } else {
+            std::any::type_name::<Self>().to_owned()
+        }
+    }
+
     fn handle(
         &mut self,
         payload: Box<dyn Any>,
