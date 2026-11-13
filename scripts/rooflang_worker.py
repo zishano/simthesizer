@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--audit-dir", type=Path)
     args = parser.parse_args()
     from rooflang.runtime.trace_export import export_trace
+    from rooflang_bridge.hardware import build_hardware
     from rooflang_bridge.llama import describe, simulate, validate_model
 
     if args.audit_dir:
@@ -33,8 +34,10 @@ def main():
                     )
                 }:
                     raise ValueError("model memory metadata does not match Llama graph")
+                _, _, _, hardware_info = build_hardware(req["hardware"], req["tp"])
+                req["resolved_hardware"] = hardware_info
                 config = req
-                reply = {"ready": True, "version": 1}
+                reply = {"ready": True, "version": 1, "hardware": hardware_info}
                 if args.audit_dir:
                     (args.audit_dir / "init.json").write_text(json.dumps(req, indent=2))
             elif req["op"] == "iteration" and config:

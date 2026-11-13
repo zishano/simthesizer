@@ -17,6 +17,8 @@ pub struct RooflangRunner {
     hardware: Value,
     #[serde(skip)]
     worker: Option<Worker>,
+    #[serde(skip)]
+    hardware_label: String,
 }
 struct Worker {
     child: Child,
@@ -51,7 +53,8 @@ impl Module for RooflangRunner {}
 impl LogicalHandler for RooflangRunner {
     fn describe(&self, payload: &dyn Any) -> String {
         format!(
-            "RooflangIteration {{ duration_s: {:?} }}",
+            "RooflangIteration {{ hardware: {}, duration_s: {:?} }}",
+            self.hardware_label,
             payload.downcast_ref::<f64>()
         )
     }
@@ -96,6 +99,20 @@ impl ModelRunner for RooflangRunner {
         ensure!(
             response["ready"] == true,
             "Rooflang worker did not initialize"
+        );
+        let hardware = &response["hardware"];
+        self.hardware_label = format!(
+            "{} x {}",
+            hardware["gpu_count"]
+                .as_u64()
+                .context("missing GPU count")?,
+            hardware["gpu_model"]
+                .as_str()
+                .context("missing GPU model")?
+        );
+        eprintln!(
+            "Rooflang hardware: {} (TP={})",
+            self.hardware_label, self.tp
         );
         self.worker = Some(worker);
         Ok(())

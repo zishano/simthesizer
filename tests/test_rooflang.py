@@ -73,6 +73,37 @@ class RooflangGraphTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build(batch((1, 1)), 3, HW)
 
+    def test_original_hardware_presets_and_card_allocation(self):
+        from rooflang.programs.presets.h200 import H200Cluster
+        from rooflang.programs.presets.rtx6000d import RTX6000DCluster
+        from rooflang_bridge.hardware import build_hardware
+
+        for model, cls, flops, capacity, bandwidth, collective_bw in [
+            ("rtx6000d", RTX6000DCluster, 148.0, 84.0, 1398.0, 100.0),
+            ("h200", H200Cluster, 989.5, 144.0, 4800.0, 450.0),
+        ]:
+            config = {"gpu_model": model, "gpu_count": 2}
+            hw, gpu, mem, info = build_hardware(config, 2)
+            self.assertIsInstance(hw, cls)
+            self.assertEqual(len(gpu), 2)
+            self.assertEqual(info["topology_gpu_count"], 8)
+            self.assertTrue(all(d.tflops["fp16"] == flops for d in gpu))
+            self.assertTrue(all(m.capacity_gb == capacity for m in mem))
+            self.assertEqual(info["devices"][0]["memory_bandwidth_gbs"], bandwidth)
+            self.assertEqual(hw.find_aggregate_bandwidth(gpu), collective_bw)
+            result, summary = simulate(batch((3, 0)), 2, config)
+            self.assertGreater(result.total_time_us, 0)
+            self.assertEqual(summary["hardware"], info)
+            self.assertEqual(
+                {t.device.name for t in result.trace}, {d.name for d in gpu}
+            )
+        for config in [
+            {"gpu_model": "rtx6000d", "gpu_count": 1},
+            {"gpu_model": "unknown", "gpu_count": 2},
+        ]:
+            with self.assertRaises(ValueError):
+                build_hardware(config, 2)
+
 
 class RooflangIntegrationTests(unittest.TestCase):
     def run_case(
@@ -99,8 +130,12 @@ class RooflangIntegrationTests(unittest.TestCase):
             "command = " + json.dumps(command) if l.startswith("command =") else l
             for l in source.splitlines()
         )
-        source = source.replace("tp = 1", f"tp = {tp}").replace(
-            "max_num_batched_tokens = 2048", f"max_num_batched_tokens = {budget}"
+        source = (
+            source.replace("tp = 2", f"tp = {tp}")
+            .replace("gpu_count = 2", f"gpu_count = {tp}")
+            .replace(
+                "max_num_batched_tokens = 2048", f"max_num_batched_tokens = {budget}"
+            )
         )
         if python_model or model_command is not None:
             model_command = (
@@ -193,6 +228,13 @@ class RooflangIntegrationTests(unittest.TestCase):
             ]
             labels = [r.get("details", {}).get("label", "") for r in graph]
             self.assertEqual(sum("RooflangIteration" in s for s in labels), 4)
+            self.assertTrue(
+                all(
+                    f"{tp} x NVIDIA RTX 6000D" in label
+                    for label in labels
+                    if "RooflangIteration" in label
+                )
+            )
 
     def test_mixed_batch_and_model_rejection(self):
         root, run = self.run_case([self.request(0, 2, 3), self.request(1, 4, 2)])

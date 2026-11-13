@@ -4,16 +4,16 @@ GEMMs are batched across queries; attention preserves each request's lengths.
 Costs are analytical, not calibrated GPU measurements. See architectures/rooflang.md.
 """
 
-import math
 from fractions import Fraction
 
-from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
-from rooflang.language.hardware.component import Compute, Memory
+from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.comm import AllGather, AllReduce
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.runtime.simulator import Simulator
+
+from rooflang_bridge.hardware import build_hardware
 
 H, FF, QH, KVH, D, V, L = 4096, 14336, 32, 8, 128, 128256, 32
 
@@ -107,57 +107,9 @@ def build(batch, tp, hardware):
             raise ValueError(
                 "require q_len>0, kv_len>=0 and one logits row per request"
             )
-    required = {
-        "tflops_fp16",
-        "memory_bandwidth_gbs",
-        "memory_capacity_gb",
-        "link_bandwidth_gbs",
-        "link_latency_us",
-    }
-    if set(hardware) != required or any(
-        not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
-        for v in hardware.values()
-    ):
-        raise ValueError("invalid hardware schema")
-    if any(hardware[k] <= 0 for k in required - {"link_latency_us"}):
-        raise ValueError("hardware capacities and rates must be positive")
+    hw, gpu, mem, hardware_info = build_hardware(hardware, tp)
     g = ComputeGraph()
-    hw = HardwareGraph()
     p = Placement(hardware=hw, graph=g)
-    gpu = []
-    mem = []
-    for rank in range(tp):
-        dev = Compute(name=f"gpu{rank}", tflops={"fp16": hardware["tflops_fp16"]})
-        ram = Memory(name=f"hbm{rank}", capacity_gb=hardware["memory_capacity_gb"])
-        hw.add_node(dev)
-        hw.add_node(ram)
-        gpu.append(dev)
-        mem.append(ram)
-        bw = hardware["memory_bandwidth_gbs"]
-        hw.add_edge(
-            FabricEdge(
-                name=f"hbm{rank}",
-                src=dev,
-                dst=ram,
-                src_to_dst_bandwidth_gbs=bw,
-                dst_to_src_bandwidth_gbs=bw,
-                is_full_duplex=False,
-            )
-        )
-    for a in range(tp):
-        for b in range(a + 1, tp):
-            bw = hardware["link_bandwidth_gbs"]
-            hw.add_edge(
-                FabricEdge(
-                    name=f"link{a}-{b}",
-                    src=gpu[a],
-                    dst=gpu[b],
-                    src_to_dst_bandwidth_gbs=bw,
-                    dst_to_src_bandwidth_gbs=bw,
-                    is_full_duplex=True,
-                    alpha_us=hardware["link_latency_us"],
-                )
-            )
 
     def tensor(n, wid=None):
         return Tensor("fp16", (n,), weight_id=wid)
@@ -406,6 +358,7 @@ def build(batch, tp, hardware):
             "causal_pairs": pairs,
             "tp": tp,
             "layers": L,
+            "hardware": hardware_info,
         },
     )
 

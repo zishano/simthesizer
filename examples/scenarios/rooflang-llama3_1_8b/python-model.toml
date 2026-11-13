@@ -1,26 +1,23 @@
 [system]
 kind = "single_instance"
 
-# Synthetic hardware for semantic validation, not an RTX PRO 6000 calibration.
+# Rooflang RTX 6000D preset; two allocated GPUs in its standard 8-GPU topology.
 # Run from the repository root with Python able to import Rooflang dependencies.
 [system.model_runner]
 kind = "rooflang"
-tp = 1
+tp = 2
 command = ["uv", "run", "--locked", "python", "scripts/rooflang_worker.py"]
 
 [system.model_runner.hardware]
-tflops_fp16 = 100.0
-memory_bandwidth_gbs = 1000.0
-memory_capacity_gb = 96.0
-link_bandwidth_gbs = 100.0
-link_latency_us = 1.0
+gpu_model = "rtx6000d"
+gpu_count = 2
 
 [system.scheduler]
 kind = "chunked_prefill"
 block_size = 16
 max_batch = 32
 max_num_batched_tokens = 2048
-device_mem = 96000000000
+device_mem = 84000000000
 device_mem_utilization = 0.9
 enable_prefix_caching = false
 

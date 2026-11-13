@@ -78,15 +78,31 @@ analytical FP16 prototype, not a measured vLLM performance replacement.
   AllGather before replicated sampling: 66 collectives for TP>1. This differs
   deliberately from the older Ring runner's 64 block-only collectives.
 - Rooflang uses its aggregate collective model on explicitly configured
-  full-mesh links, not a measured NCCL topology or packet-level ring.
+  preset fabrics, not a measured NCCL implementation or packet-level ring.
 - Weights and existing KV are resident tensors in each fresh execution;
   activation lifetimes follow data edges and residual forks. KV append is
   retained until the iteration sink. Scheduler KV allocation remains rounded
   to blocks and includes all admitted requests; Rooflang models exact active
   batch bytes. Its peak memory is not a replacement for scheduler admission or
   a report of all idle retained KV. An active-wave OOM aborts the run.
-- The supplied 100 TFLOP/s, 1000 GB/s, 96 GB hardware and 100 GB/s links are
-  synthetic diagnostic inputs. They do not claim to reproduce the RTX example.
+- Example configs select `gpu_model = "rtx6000d"`, `gpu_count = 2`, TP=2.
+  `rtx6000d` and `h200` directly instantiate the copied upstream cluster classes;
+  no rates are overridden. RTX 6000D uses 148 FP16 TFLOP/s, 84 GB GDDR7,
+  1398 GB/s local memory and 100 GB/s Ethernet; H200 uses 989.5 FP16 TFLOP/s,
+  144 GB HBM3e, 4800 GB/s local memory and 450 GB/s NVLink ports, as encoded
+  upstream. These are Rooflang preset assumptions, not independently calibrated
+  measurements. RTX 6000D is not the original RTX PRO 6000 profiling target.
+- Both upstream classes build an 8-GPU node with supporting CPU, memory and
+  switch infrastructure. `gpu_count` allocates the first N GPUs of that topology
+  and must equal TP (1/2/4/8). Unallocated GPUs execute no kernels; full topology
+  is preserved, including the original collective bandwidth override. Logs,
+  outer iteration labels and the explorer show model and allocated count;
+  the hardware view separately reports total topology count.
+- Scheduler `device_mem` must match the selected per-card preset capacity:
+  84000000000 bytes for RTX 6000D or 144000000000 for H200. The example uses
+  the former. Admission and model state remain owned by the original scheduler.
+- Raw numeric hardware inputs remain supported only for diagnostic sensitivity
+  tests and replaying earlier synthetic audits.
 
 ## Running
 
@@ -101,7 +117,9 @@ cargo run --release --locked -- \
 
 Use `examples/scenarios/rooflang-llama3_1_8b/python-model.toml` instead to
 select the Python definition. Both configs run the bundled worker through
-`uv run --locked python`. Set `tp = 2` to enable TP communication. Add `--audit-dir PATH` to the worker
+`uv run --locked python`. Set both `tp` and `gpu_count` to change the allocated
+card count; TP>1 enables communication. Set `gpu_model = "h200"` and adjust
+scheduler `device_mem` to select the H200 preset. Add `--audit-dir PATH` to the worker
 command for a fresh directory containing init metadata, exact batches, per-round
 summaries, and per-kernel Perfetto traces. Export the existing engine graph/state
 traces to correlate round durations and token commits. The outer graph has one
@@ -129,3 +147,24 @@ Rooflang tests run in the normal project environment without optional skips: rag
 and link sensitivity, hardware units and OOM, chunked-prefill/token timing,
 mixed batches/model rejection, and single-instance enforcement. Tests use the
 compiled debug CLI; set `SIMTHESIZER_BIN` for the integration cases when needed.
+
+## Whole-run graph explorer
+
+With both `--output-graph-trace` and worker `--audit-dir` enabled, export an
+offline HTML view and complete JSON graph data:
+
+```sh
+uv run --locked python scripts/draw_rooflang.py \
+  --trace output/rooflang-full-graph/outer.jsonl \
+  --audit-dir output/rooflang-full-graph/audit \
+  --output output/rooflang-full-graph/index.html
+```
+
+The outer view replays recorded graph mutations. Each iteration links to a
+complete inner graph, with layer filtering, tensor/weight details, hardware
+links and optional stream-order edges. Inner graphs are reconstructed from
+recorded batches using the current bundled builder; the exporter checks both
+reconstructed and outer durations against the audit and rejects mismatches.
+Use the source revision that produced the audit. This is an offline view,
+not a change to execution or an assertion that inner nodes exist in the outer
+engine. Graph dependencies and observed stream order are shown separately.
