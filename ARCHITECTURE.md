@@ -71,6 +71,9 @@ own all serving semantics and reach the engine only through graph nodes.
 - A `ComputeSimulator` prices one layer for one batch. A `NetworkSimulator`
   prices point-to-point transfers over a topology; see
   [cost models](architectures/cost-models.md).
+- An exclusive-resource Rooflang runner uses bundled source to price whole Llama
+  iterations from Rust or Python model definitions, without profiling tables;
+  see [Rooflang integration](architectures/rooflang.md).
 - `scripts/profile.py` measures vLLM components and preserves exact batch shapes
   in JSONL; see [profiling](architectures/profiling.md).
 - `scripts/baseline.py` replays single-call workloads and records client-visible

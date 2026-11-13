@@ -1,0 +1,35 @@
+[system]
+kind = "single_instance"
+
+# Synthetic hardware for semantic validation, not an RTX PRO 6000 calibration.
+# Run from the repository root with Python able to import Rooflang dependencies.
+[system.model_runner]
+kind = "rooflang"
+tp = 1
+command = ["uv", "run", "--locked", "python", "scripts/rooflang_worker.py"]
+
+[system.model_runner.hardware]
+tflops_fp16 = 100.0
+memory_bandwidth_gbs = 1000.0
+memory_capacity_gb = 96.0
+link_bandwidth_gbs = 100.0
+link_latency_us = 1.0
+
+[system.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 2048
+device_mem = 96000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.model]
+kind = "llama3_1"
+hidden_size = 4096
+intermediate_size = 14336
+max_position_embeddings = 131072
+num_attention_heads = 32
+num_hidden_layers = 32
+num_key_value_heads = 8
+vocab_size = 128256

@@ -129,6 +129,21 @@ fn output_path(path: &Path) -> Result<PathBuf> {
 fn load_config(config_path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let document: toml::Value = toml::from_str(&raw)?;
+    fn uses_rooflang(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Table(table) => {
+                table.get("kind").and_then(toml::Value::as_str) == Some("rooflang")
+                    || table.values().any(uses_rooflang)
+            }
+            toml::Value::Array(values) => values.iter().any(uses_rooflang),
+            _ => false,
+        }
+    }
+    if uses_rooflang(&document) {
+        anyhow::ensure!(document.get("system").and_then(|s|s.get("kind")).and_then(toml::Value::as_str) == Some("single_instance"),
+            "Rooflang whole-iteration backend requires a single_instance root with exclusive resources");
+    }
     toml::from_str(&raw).with_context(|| format!("failed to parse {}", config_path.display()))
 }
 
