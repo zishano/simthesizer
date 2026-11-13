@@ -117,6 +117,7 @@ class RooflangIntegrationTests(unittest.TestCase):
         python_model=False,
         model_command=None,
         rebuild_graph=False,
+        trace_rounds=None,
     ):
         root = Path(tempfile.mkdtemp(prefix="rooflang-test-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(root))
@@ -129,6 +130,8 @@ class RooflangIntegrationTests(unittest.TestCase):
             "--audit-dir",
             str(root / "audit"),
         ]
+        if trace_rounds is not None:
+            command.extend(["--audit-trace-rounds", *map(str, trace_rounds)])
         if rebuild_graph:
             command.append("--rebuild-graph")
         source = "\n".join(
@@ -309,6 +312,43 @@ class RooflangIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 normalized(path), normalized(rebuilt / "audit" / path.name)
             )
+
+    def test_selected_audit_rounds_preserve_summaries_and_results(self):
+        requests = [self.request(0, 5, 3)]
+        full, run = self.run_case(requests, tp=2)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        selected, run = self.run_case(requests, tp=2, trace_rounds=[0, 3])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(
+            (full / "result.jsonl").read_text(), (selected / "result.jsonl").read_text()
+        )
+        self.assertEqual(
+            sorted(p.name for p in (selected / "audit").glob("*.trace.json")),
+            ["00000.trace.json", "00003.trace.json"],
+        )
+        for path in (full / "audit").glob("*.json"):
+            if ".trace." not in path.name:
+                self.assertEqual(
+                    json.loads(path.read_text()),
+                    json.loads((selected / "audit" / path.name).read_text()),
+                )
+
+    def test_timing_checker_detects_corrupt_operator_duration(self):
+        from check_rooflang_timing import check
+
+        root, run = self.run_case([self.request(0, 5, 3)], tp=2, trace_rounds=[0, 3])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report, costs = check(root / "graph.jsonl", root / "audit")
+        self.assertEqual(report["rounds_checked"], 4)
+        self.assertEqual(len(report["detailed_rounds"]), 2)
+        self.assertTrue(costs)
+        path = root / "audit/00000.trace.json"
+        data = json.loads(path.read_text())
+        event = next(e for e in data["traceEvents"] if e.get("ph") == "X")
+        event["dur"] += 1
+        path.write_text(json.dumps(data))
+        with self.assertRaises(ValueError):
+            check(root / "graph.jsonl", root / "audit")
 
     def test_python_model_protocol_and_memory_mismatch_fail(self):
         descriptor = describe({"tp": 1, "pp": 1, "ep": 1})

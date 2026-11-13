@@ -196,3 +196,31 @@ reconstructed and outer durations against the audit and rejects mismatches.
 Use the source revision that produced the audit. This is an offline view,
 not a change to execution or an assertion that inner nodes exist in the outer
 engine. Graph dependencies and observed stream order are shown separately.
+
+
+## Timing coordination inspection
+
+`--audit-trace-rounds 0 1 100 1000` on the worker retains summaries for every
+iteration but exports detailed Perfetto events only at selected zero-based
+indices. Without this option all audited rounds get full traces. Then run:
+
+```sh
+uv run --locked python scripts/check_rooflang_timing.py \
+  --trace output/outer.jsonl --audit-dir output/audit --output-dir output/check
+```
+
+The checker verifies all outer duration conversions and exclusive iteration
+order, then checks sampled operator costs against fresh graph execution,
+stream serialization and graph dependencies. Its max(compute,memory,network)
+check assumes this backend's exclusive devices and stream0; it is not a generic
+contention checker. The CSV reports base compute, local-memory and network costs
+separately from elapsed time. Per-device collective trace entries represent one
+shared collective; summing all GPU lanes double-counts concurrent work.
+
+Upstream runtime assumptions remain visible: local tensor reads/writes contribute
+to memory time and overlap compute; network time includes route latency plus
+transfer and overlaps local work within a kernel. Current collectives block all
+participant stream0 lanes. Multi-participant collectives do not separately price
+HBM traffic, and local memory fabric alpha is not added to each tensor access.
+Weights and prior KV are resident, so no initial host-to-device loading is priced.
+These are modeling boundaries, not evidence of calibrated GPU accuracy.
