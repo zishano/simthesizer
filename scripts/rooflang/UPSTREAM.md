@@ -7,7 +7,7 @@ License: MIT; see LICENSE.txt and preserved source headers.
 The Python source files are copied unchanged from this revision. Included:
 graphs, tensors, hardware components, placement, forward/identity/communication
 kernels, dtype utilities, simulator and trace export, with their package files.
-The RTX 6000D and H200 hardware presets and their package files are also
+The RTX 6000D, H200 and B300 hardware presets and their package files are also
 copied unchanged. Other programs, experiments, optimization passes and training
 kernels are omitted.
 Package docstrings may describe upstream modules outside this subset.

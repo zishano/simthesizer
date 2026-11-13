@@ -4,6 +4,7 @@ import math
 
 from rooflang.language.graph import FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
+from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.h200 import H200Cluster
 from rooflang.programs.presets.rtx6000d import RTX6000DCluster
 
@@ -25,6 +26,9 @@ def build_hardware(config, tp):
     elif model == "h200":
         hw = H200Cluster()
         label = "NVIDIA H200 SXM"
+    elif model == "b300":
+        hw = B300Cluster()
+        label = "NVIDIA B300 SXM"
     else:
         raise ValueError(f"unsupported Rooflang GPU preset: {model}")
     all_gpus = sorted((n for n in hw.nodes if n.kind == "gpu"), key=lambda n: n.name)

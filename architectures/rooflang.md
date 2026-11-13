@@ -86,20 +86,22 @@ analytical FP16 prototype, not a measured vLLM performance replacement.
   batch bytes. Its peak memory is not a replacement for scheduler admission or
   a report of all idle retained KV. An active-wave OOM aborts the run.
 - Example configs select `gpu_model = "rtx6000d"`, `gpu_count = 2`, TP=2.
-  `rtx6000d` and `h200` directly instantiate the copied upstream cluster classes;
+  `rtx6000d`, `h200` and `b300` directly instantiate the copied upstream cluster classes;
   no rates are overridden. RTX 6000D uses 148 FP16 TFLOP/s, 84 GB GDDR7,
   1398 GB/s local memory and 100 GB/s Ethernet; H200 uses 989.5 FP16 TFLOP/s,
   144 GB HBM3e, 4800 GB/s local memory and 450 GB/s NVLink ports, as encoded
-  upstream. These are Rooflang preset assumptions, not independently calibrated
+  upstream. B300 uses 2250 FP16 TFLOP/s, 288 GB HBM3e, 7750 GB/s local
+  memory and 900 GB/s NVLink ports. These are Rooflang preset assumptions, not independently calibrated
   measurements. RTX 6000D is not the original RTX PRO 6000 profiling target.
-- Both upstream classes build an 8-GPU node with supporting CPU, memory and
+- All three upstream classes build an 8-GPU node with supporting CPU, memory and
   switch infrastructure. `gpu_count` allocates the first N GPUs of that topology
   and must equal TP (1/2/4/8). Unallocated GPUs execute no kernels; full topology
   is preserved, including the original collective bandwidth override. Logs,
   outer iteration labels and the explorer show model and allocated count;
   the hardware view separately reports total topology count.
 - Scheduler `device_mem` must match the selected per-card preset capacity:
-  84000000000 bytes for RTX 6000D or 144000000000 for H200. The example uses
+  84000000000 bytes for RTX 6000D, 144000000000 for H200, or
+  288000000000 for B300. The example uses
   the former. Admission and model state remain owned by the original scheduler.
 - Raw numeric hardware inputs remain supported only for diagnostic sensitivity
   tests and replaying earlier synthetic audits.

@@ -74,6 +74,7 @@ class RooflangGraphTests(unittest.TestCase):
             build(batch((1, 1)), 3, HW)
 
     def test_original_hardware_presets_and_card_allocation(self):
+        from rooflang.programs.presets.b300 import B300Cluster
         from rooflang.programs.presets.h200 import H200Cluster
         from rooflang.programs.presets.rtx6000d import RTX6000DCluster
         from rooflang_bridge.hardware import build_hardware
@@ -81,6 +82,7 @@ class RooflangGraphTests(unittest.TestCase):
         for model, cls, flops, capacity, bandwidth, collective_bw in [
             ("rtx6000d", RTX6000DCluster, 148.0, 84.0, 1398.0, 100.0),
             ("h200", H200Cluster, 989.5, 144.0, 4800.0, 450.0),
+            ("b300", B300Cluster, 2250.0, 288.0, 7750.0, 900.0),
         ]:
             config = {"gpu_model": model, "gpu_count": 2}
             hw, gpu, mem, info = build_hardware(config, 2)
