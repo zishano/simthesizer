@@ -9,14 +9,20 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit-dir", type=Path)
+    parser.add_argument(
+        "--rebuild-graph",
+        action="store_true",
+        help="diagnostic reference: rebuild the graph every iteration",
+    )
     args = parser.parse_args()
     from rooflang.runtime.trace_export import export_trace
     from rooflang_bridge.hardware import build_hardware
-    from rooflang_bridge.llama import describe, simulate, validate_model
+    from rooflang_bridge.llama import LlamaTemplate, describe, simulate, validate_model
 
     if args.audit_dir:
         args.audit_dir.mkdir(parents=True, exist_ok=False)
     config = None
+    template = None
     iteration = 0
     for line in sys.stdin:
         try:
@@ -34,14 +40,24 @@ def main():
                     )
                 }:
                     raise ValueError("model memory metadata does not match Llama graph")
-                _, _, _, hardware_info = build_hardware(req["hardware"], req["tp"])
+                if args.rebuild_graph:
+                    _, _, _, hardware_info = build_hardware(req["hardware"], req["tp"])
+                    template = None
+                else:
+                    template = LlamaTemplate(req["tp"], req["hardware"])
+                    hardware_info = template.summary["hardware"]
                 req["resolved_hardware"] = hardware_info
                 config = req
                 reply = {"ready": True, "version": 1, "hardware": hardware_info}
                 if args.audit_dir:
                     (args.audit_dir / "init.json").write_text(json.dumps(req, indent=2))
             elif req["op"] == "iteration" and config:
-                result, reply = simulate(req["batch"], config["tp"], config["hardware"])
+                if template is None:
+                    result, reply = simulate(
+                        req["batch"], config["tp"], config["hardware"]
+                    )
+                else:
+                    result, reply = template.simulate(req["batch"])
                 if args.audit_dir:
                     (args.audit_dir / f"{iteration:05d}.json").write_text(
                         json.dumps({"batch": req["batch"], **reply}, indent=2)

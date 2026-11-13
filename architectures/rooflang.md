@@ -35,8 +35,8 @@ Requested scope: FP16 Llama 3.1 8B, one serving instance with exclusive devices
 and fabrics. Scheduler admission, token commits, preemption and KV ownership
 remain in Simthesizer. `RooflangRunner` sends the exact per-request query, cached
 KV and logits lengths to a persistent Python worker. The worker validates the
-32-layer plan, expands a complete Rooflang execution graph, runs its DES, and
-returns microseconds. The runner converts once to seconds and emits one logical
+32-layer plan, builds and validates one complete Rooflang graph template,
+binds each batch to it, runs a fresh DES, and returns microseconds. The runner converts once to seconds and emits one logical
 iteration node before the existing batch-completion callback. Wall-clock IPC
 and Python runtime do not enter simulated time.
 
@@ -129,13 +129,39 @@ Rooflang iteration node; detailed compute/communication lives in the worker trac
 
 The worker is launched once per runner, uses versioned JSONL without a shell,
 and is terminated/reaped when the runner drops. Missing dependencies, unsupported
-models, worker failures and invalid durations fail explicitly. No results are
-cached, so per-round graph building can dominate wall-clock runtime.
+models, worker failures and invalid durations fail explicitly. No latency results are cached; every round still runs the complete DES.
 
 The existing scheduler reports `lm_head_len=1` for every scheduled request,
 including intermediate prefill chunks. The backend preserves that cost input;
 only the scheduler commits tokens when prefill is finished. This prototype does
 not infer a different logits mask or claim to reproduce vLLM chunk masking.
+
+## Graph template reuse
+
+Each worker owns one template for its initialized model, TP and hardware.
+Kernel and tensor identities, data edges, device/stream placement and hardware
+are built and validated once. The same construction formulas can either produce
+concrete values (`build` / `simulate`, the rebuild reference) or record batch
+bindings (`LlamaTemplate`). No second set of per-operator cost formulas exists.
+
+Each iteration validates the batch schema and updates four aggregate inputs:
+query tokens, logits rows, cached KV tokens, and the sum of per-request causal
+query-key pairs. Bindings update existing tensor shapes (including residual
+views and collective outputs), Work FLOPs, collective byte counts and embedding
+read fractions. Static weights and tensor-to-memory references remain fixed.
+The graph topology does not depend on batch cardinality in this Llama lowering.
+
+A new, unchanged upstream Simulator is created for each execution; event queues,
+resource shares, tensor lifetimes and memory accounting cannot leak across rounds,
+including after OOM. This is graph reuse, not persistent physical KV allocation,
+latency memoization, or concurrent shared-resource execution. Template results
+reference mutable kernels: consume/export their traces before binding another
+batch. The worker does this before reading the next request. Do not mutate the
+owned graph/placement externally or use a template concurrently.
+
+Add `--rebuild-graph` to the worker command for differential checks and timing
+comparisons. It preserves the original per-round construction path. Offline
+DAG export still uses this fresh-build path and checks the recorded duration.
 
 ## Validation commands
 

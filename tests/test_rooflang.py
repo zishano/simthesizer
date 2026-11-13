@@ -116,6 +116,7 @@ class RooflangIntegrationTests(unittest.TestCase):
         broken_model=False,
         python_model=False,
         model_command=None,
+        rebuild_graph=False,
     ):
         root = Path(tempfile.mkdtemp(prefix="rooflang-test-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(root))
@@ -128,6 +129,8 @@ class RooflangIntegrationTests(unittest.TestCase):
             "--audit-dir",
             str(root / "audit"),
         ]
+        if rebuild_graph:
+            command.append("--rebuild-graph")
         source = "\n".join(
             "command = " + json.dumps(command) if l.startswith("command =") else l
             for l in source.splitlines()
@@ -281,6 +284,30 @@ class RooflangIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 (rust / "result.jsonl").read_text(),
                 (python / "result.jsonl").read_text(),
+            )
+
+    def test_worker_template_matches_rebuild_including_audit_traces(self):
+        requests = [self.request(0, 5, 3), self.request(1, 4, 2)]
+        reused, run = self.run_case(requests, tp=2)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        rebuilt, run = self.run_case(requests, tp=2, rebuild_graph=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(
+            (reused / "result.jsonl").read_text(),
+            (rebuilt / "result.jsonl").read_text(),
+        )
+
+        def normalized(path):
+            data = json.loads(path.read_text())
+            if "traceEvents" in data:
+                # Upstream emits device metadata / peak memory from unordered sets.
+                data["traceEvents"].sort(key=lambda e: json.dumps(e, sort_keys=True))
+                data["otherData"]["peak_memory"].sort(key=lambda m: m["name"])
+            return data
+
+        for path in (reused / "audit").glob("*.json"):
+            self.assertEqual(
+                normalized(path), normalized(rebuilt / "audit" / path.name)
             )
 
     def test_python_model_protocol_and_memory_mismatch_fail(self):

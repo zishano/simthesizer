@@ -13,6 +13,7 @@ from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.runtime.simulator import Simulator
 
+from rooflang_bridge.bindings import BatchBindings
 from rooflang_bridge.hardware import build_hardware
 
 H, FF, QH, KVH, D, V, L = 4096, 14336, 32, 8, 128, 128256, 32
@@ -93,9 +94,7 @@ def validate_model(model, tp):
         raise ValueError("backend supports exactly FP16 Llama 3.1 8B layer plan")
 
 
-def build(batch, tp, hardware):
-    if tp not in (1, 2, 4, 8):
-        raise ValueError("TP must be 1, 2, 4 or 8")
+def batch_shape(batch):
     if not batch:
         raise ValueError("empty batch")
     for r in batch:
@@ -107,12 +106,34 @@ def build(batch, tp, hardware):
             raise ValueError(
                 "require q_len>0, kv_len>=0 and one logits row per request"
             )
+    return {
+        "tokens": sum(r["q_len"] for r in batch),
+        "logits_rows": len(batch),
+        "causal_pairs": sum(
+            r["q_len"] * r["kv_len"] + r["q_len"] * (r["q_len"] + 1) // 2 for r in batch
+        ),
+        "kv_tokens": sum(r["kv_len"] for r in batch),
+    }
+
+
+def build(batch, tp, hardware, *, _bindings=None):
+    if tp not in (1, 2, 4, 8):
+        raise ValueError("TP must be 1, 2, 4 or 8")
+    shape = batch_shape(batch)
+    bindings = _bindings if _bindings is not None else BatchBindings()
+    tokens = bindings.parameter("tokens", shape["tokens"])
+    heads = bindings.parameter("logits_rows", shape["logits_rows"])
+    pairs = bindings.parameter("causal_pairs", shape["causal_pairs"])
+    kv_tokens = bindings.parameter("kv_tokens", shape["kv_tokens"])
     hw, gpu, mem, hardware_info = build_hardware(hardware, tp)
     g = ComputeGraph()
     p = Placement(hardware=hw, graph=g)
 
     def tensor(n, wid=None):
-        return Tensor("fp16", (n,), weight_id=wid)
+        t = Tensor("fp16", (0,), weight_id=wid)
+        bindings.assign(t, "shape", n, lambda size: (size,))
+        bindings.tensor_sizes[t] = n
+        return t
 
     def op(rank, name, flops, sources, nout, weights=None, extra_outputs=None):
         inputs = {
@@ -120,7 +141,8 @@ def build(batch, tp, hardware):
         }
         outputs = {"y": tensor(nout)}
         outputs.update(extra_outputs or {})
-        k = Work(name, flops, inputs, outputs, weights)
+        k = Work(name, 0, inputs, outputs, weights)
+        bindings.assign(k, "work", flops)
         g.add_kernel(k)
         for i, (source, port) in enumerate(sources):
             g.add_data_edge(source, k, {port: f"x{i}"})
@@ -135,14 +157,15 @@ def build(batch, tp, hardware):
         fan.name = "residual_fork"
         t = source.outputs["y"]
         fan.inputs = {"x": t}
-        fan.outputs = {f"y{i}": tensor(t.n_elements) for i in range(2)}
+        fan.outputs = {f"y{i}": tensor(bindings.tensor_sizes[t]) for i in range(2)}
         g.add_kernel(fan)
         g.add_data_edge(source, fan, {"y": "x"})
         p.set_kernel_device(fan, gpu[rank])
         views = []
         for i in range(2):
             view = Nop(
-                inputs={"x": fan.outputs[f"y{i}"]}, outputs={"y": tensor(t.n_elements)}
+                inputs={"x": fan.outputs[f"y{i}"]},
+                outputs={"y": tensor(bindings.tensor_sizes[t])},
             )
             view.name = "residual_view"
             g.add_kernel(view)
@@ -155,10 +178,11 @@ def build(batch, tp, hardware):
         if tp == 1:
             return previous
         k = cls(
-            total_bytes=rows * width * 2,
+            total_bytes=0,
             world=tp,
             **({"dtype": "fp16"} if cls is AllReduce else {}),
         )
+        bindings.assign(k, "total_bytes", rows * width * 2)
         k.name = name
         k.inputs = {f"x{r}": previous[r].outputs["y"] for r in range(tp)}
         k.outputs = {f"y{r}": tensor(rows * width) for r in range(tp)}
@@ -182,11 +206,6 @@ def build(batch, tp, hardware):
             result.append(view)
         return result
 
-    tokens = sum(r["q_len"] for r in batch)
-    heads = len(batch)
-    pairs = sum(
-        r["q_len"] * r["kv_len"] + r["q_len"] * (r["q_len"] + 1) // 2 for r in batch
-    )
     previous = []
     kv_appends = []
     for r in range(tp):
@@ -199,7 +218,7 @@ def build(batch, tp, hardware):
             {"table": tensor(V // tp * H, f"embedding.{r}")},
         )
         # Uniform vocabulary shard hits; gather reads only selected rows, not full table.
-        emb.weight_read_fraction = Fraction(tokens, V)
+        bindings.assign(emb, "weight_read_fraction", tokens, lambda n: Fraction(n, V))
         previous.append(emb)
     previous = collective(previous, "embedding_allreduce", tokens, H)
     for layer in range(L):
@@ -233,7 +252,7 @@ def build(batch, tp, hardware):
                 [(qkv, "y")],
                 tokens * width,
             )
-            kv = sum(x["kv_len"] for x in batch) * 2 * (KVH // tp) * D
+            kv = kv_tokens * 2 * (KVH // tp) * D
             attn = op(
                 r,
                 prefix + "attention",
@@ -353,9 +372,9 @@ def build(batch, tp, hardware):
         p,
         hw,
         {
-            "tokens": tokens,
-            "logits_rows": heads,
-            "causal_pairs": pairs,
+            "tokens": shape["tokens"],
+            "logits_rows": shape["logits_rows"],
+            "causal_pairs": shape["causal_pairs"],
             "tp": tp,
             "layers": L,
             "hardware": hardware_info,
@@ -365,6 +384,10 @@ def build(batch, tp, hardware):
 
 def simulate(batch, tp, hardware):
     g, p, hw, summary = build(batch, tp, hardware)
+    return _run(g, p, hw, summary)
+
+
+def _run(g, p, hw, summary):
     result = Simulator(g, p, hw).run()
     summary.update(
         duration_us=result.total_time_us,
@@ -373,3 +396,34 @@ def simulate(batch, tp, hardware):
         peak_memory_bytes={m.name: n for m, n in result.peak_memory.items()},
     )
     return result, summary
+
+
+class LlamaTemplate:
+    """One fixed model/TP/hardware graph, rebound between exclusive iterations.
+
+    Results contain references to mutable kernels. Consume/export a result's
+    trace before the next call, as the worker does. Do not share across workers.
+    """
+
+    def __init__(self, tp, hardware):
+        self.bindings = BatchBindings(record=True)
+        self.graph, self.placement, self.hardware, self.summary = build(
+            [{"q_len": 1, "kv_len": 0, "lm_head_len": 1}],
+            tp,
+            hardware,
+            _bindings=self.bindings,
+        )
+
+    def bind(self, batch):
+        shape = batch_shape(batch)
+        self.bindings.bind(shape)
+        return {
+            **self.summary,
+            **{k: shape[k] for k in ("tokens", "logits_rows", "causal_pairs")},
+        }
+
+    def simulate(self, batch):
+        summary = self.bind(batch)
+        # A new runtime keeps events, memory accounting and failed runs isolated.
+        # Graph, tensor identities, placement and hardware remain unchanged.
+        return _run(self.graph, self.placement, self.hardware, summary)
