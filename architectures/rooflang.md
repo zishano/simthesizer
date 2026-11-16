@@ -224,3 +224,15 @@ participant stream0 lanes. Multi-participant collectives do not separately price
 HBM traffic, and local memory fabric alpha is not added to each tensor access.
 Weights and prior KV are resident, so no initial host-to-device loading is priced.
 These are modeling boundaries, not evidence of calibrated GPU accuracy.
+
+## One-command inspection
+
+Run `uv run --locked python scripts/inspect_rooflang.py` from the repository.
+The default small workload exports metrics, both graph views, timing checks and
+an `index.html` linking the artifacts in a new directory under `output/`.
+Use `--gpu-model h200 --tp 4 --model-entry python` to select hardware and entry.
+Use `--workload examples/workloads/realistic.jsonl` for a full workload: detailed
+traces are sampled and HTML graph generation is disabled unless `--full-graphs`
+is given. `--trace-rounds` selects detailed rounds; all summaries remain saved.
+`--reference PATH` adds a comparison with matching measured results.
+`--output-dir PATH` requires a new directory to prevent mixing runs.
