@@ -84,9 +84,23 @@ Render a self-contained browser replay with:
 uv run --locked python scripts/draw_graph.py output/graph.jsonl --output output/graph.html
 ```
 
-The viewer retains all nodes, pages them in creation order, and exposes cross-page
-dependencies and creation causes through clickable details. Replay follows graph
-operation order and shows simulated execution status using finish times. It
-preserves `FastForward` nodes rather than inventing unexpanded model layers.
+The default view groups repeated events into request, scheduling, iteration
+control, compute, and optional network/other modules. Cross-module edges aggregate
+non-withdrawn dependencies; grouping may introduce cycles absent from the event
+DAG. Module progress follows simulated time: active intervals are first dispatch
+through finish (exclusive), and zero-duration events complete at their timestamp.
+The time overview counts starts per bin, not utilization or duration.
+
+Compute details group executions by their nearest scheduling creator, retaining
+each node ID even for repeated operator names. The table reports first dispatch,
+finish, and elapsed simulated time; fast-forward time remains separate. Selection
+can follow time or hold a chosen round. `--workload PATH` adds input counts and a
+SHA-256 fingerprint supplied by the viewer caller; version-1 traces do not attest
+the workload path.
+
+The node detail view retains all nodes, pages them in creation order, and exposes
+cross-page dependencies and creation causes through clickable details. Its replay
+follows graph operation order. Both views preserve `FastForward` rather than
+inventing unexpanded model layers.
 Graph tracing observes the current abstraction; it does not add missing
 communication, resource models, or simulator mechanisms.
