@@ -503,6 +503,10 @@ impl Module for PdDisaggregationSystem {
 }
 
 impl System for PdDisaggregationSystem {
+    fn completed_requests(&self) -> Option<usize> {
+        Some(self.results.len())
+    }
+
     fn instance_load(&self) -> crate::types::InstanceLoad {
         self.prefill_instances
             .iter()

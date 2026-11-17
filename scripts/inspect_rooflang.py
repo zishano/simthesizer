@@ -16,11 +16,46 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def run(command, log):
     print(f"运行：{' '.join(map(str, command))}", flush=True)
-    with log.open("w") as stream:
-        result = subprocess.run(
-            command, check=False, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT
-        )
-    if result.returncode:
+    started = time.perf_counter()
+    shown = False
+    tty = sys.stdout.isatty()
+    with (
+        log.open("w") as stream,
+        subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        ) as process,
+    ):
+        try:
+            for line in process.stdout:
+                stream.write(line)
+                if line.startswith("SIMTHESIZER_PROGRESS "):
+                    stream.flush()
+                    progress = json.loads(line.removeprefix("SIMTHESIZER_PROGRESS "))
+                    completed, total = progress["completed"], progress["total"]
+                    percent = completed * 100 // total if total else 100
+                    filled = completed * 30 // total if total else 30
+                    bar = "#" * filled + "-" * (30 - filled)
+                    message = (
+                        f"仿真进度 [{bar}] {percent:3d}% | 已完成 {completed}/{total} 个请求"
+                        f" | 已用 {time.perf_counter() - started:.1f}s"
+                        f" | 仿真时间 {progress['time_s']:.3f}s"
+                    )
+                    print(
+                        ("\r" if tty else "") + message,
+                        end="" if tty else "\n",
+                        flush=True,
+                    )
+                    shown = True
+        finally:
+            if shown and tty:
+                print(flush=True)
+        returncode = process.wait()
+    if returncode:
         raise RuntimeError(f"命令失败，日志：{log}\n{log.read_text()[-4000:]}")
 
 
@@ -135,6 +170,7 @@ def main():
             "--",
             "--config",
             str(output / "config.toml"),
+            "--progress",
             "--workload",
             str(workload),
             "--output-jsonl",

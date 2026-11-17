@@ -7,6 +7,7 @@ use serde::Deserialize;
 use simthesizer_core::types::Request;
 use simthesizer_core::{Engine, Graph, System};
 
+mod progress;
 mod write_jsonl;
 mod write_trace;
 
@@ -16,6 +17,9 @@ use crate::write_jsonl::write_results_jsonl;
 struct Args {
     #[arg(long)]
     config: PathBuf,
+    /// Stream completed root-request counts to stderr.
+    #[arg(long)]
+    progress: bool,
     #[arg(long)]
     workload: PathBuf,
     #[arg(long)]
@@ -88,7 +92,9 @@ fn main() -> Result<()> {
     } else {
         Graph::new()
     };
-    load_workload(config.system.as_mut(), &mut graph, &workload_path)?;
+    let total = load_workload(config.system.as_mut(), &mut graph, &workload_path)?;
+    let mut progress = progress::Progress::new(args.progress, total);
+    progress.observe(0.0, config.system.as_ref())?;
 
     let engine = Engine::new(graph, config.system);
     let results = if let Some(path) = &args.output_engine_trace {
@@ -99,11 +105,15 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         let mut trace = write_trace::TraceWriter::new(std::io::BufWriter::new(file.as_file_mut()));
-        let results =
-            engine.run_with_observer(|time, system| trace.observe(time, system.observe()))?;
+        let results = engine.run_with_observer(|time, system| {
+            progress.observe(time, system)?;
+            trace.observe(time, system.observe())
+        })?;
         trace.finish()?;
         file.persist_noclobber(path)?;
         results
+    } else if args.progress {
+        engine.run_with_observer(|time, system| progress.observe(time, system))?
     } else {
         engine.run()?
     };
@@ -147,11 +157,16 @@ fn load_config(config_path: &Path) -> Result<Config> {
     toml::from_str(&raw).with_context(|| format!("failed to parse {}", config_path.display()))
 }
 
-fn load_workload(system: &mut dyn System, graph: &mut Graph, workload_path: &Path) -> Result<()> {
+fn load_workload(
+    system: &mut dyn System,
+    graph: &mut Graph,
+    workload_path: &Path,
+) -> Result<usize> {
     let file = std::fs::File::open(workload_path)
         .with_context(|| format!("failed to open {}", workload_path.display()))?;
     let reader = std::io::BufReader::new(file);
 
+    let mut count = 0;
     for (line_index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
             format!(
@@ -179,6 +194,7 @@ fn load_workload(system: &mut dyn System, graph: &mut Graph, workload_path: &Pat
             )
         })?;
         system.add_request_arrival(request, graph, None, None)?;
+        count += 1;
     }
-    Ok(())
+    Ok(count)
 }

@@ -22,6 +22,21 @@ omitted; the first and final engine times remain. Writing retains one snapshot
 in memory and uses a temporary file. The file is published only after a
 successful simulation and flush; existing trace files are never replaced.
 
+## Request progress
+
+`System::completed_requests` exposes the length of retained root results;
+`None` means unsupported. Single-instance, EP and P/D systems use their own
+result collections; multi-instance systems sum child collections. Forwarded
+P/D child results are excluded, so prefill completion is not request completion.
+No second counter or scheduling state is maintained.
+
+CLI `--progress` emits `SIMTHESIZER_PROGRESS` JSON lines to stderr at count
+changes, with `completed`, valid workload-row `total`, and engine `time_s`.
+The existing engine observer supplies completed timestamps. Inspection streams
+these lines into a terminal progress bar while retaining the full command log.
+100% means all requests finished; report generation is a separate subsequent
+stage. The display does not estimate completion from elapsed wall time.
+
 ## Scheduler signals
 
 `chunked_prefill` exposes:

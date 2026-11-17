@@ -80,6 +80,12 @@ impl Module for MultiInstanceSystem {
 }
 
 impl System for MultiInstanceSystem {
+    fn completed_requests(&self) -> Option<usize> {
+        self.instances.iter().try_fold(0, |total, system| {
+            Some(total + system.completed_requests()?)
+        })
+    }
+
     fn instance_load(&self) -> InstanceLoad {
         self.instances
             .iter()

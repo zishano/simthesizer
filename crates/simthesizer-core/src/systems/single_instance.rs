@@ -427,6 +427,10 @@ impl Module for SingleInstanceSystem {
 }
 
 impl System for SingleInstanceSystem {
+    fn completed_requests(&self) -> Option<usize> {
+        Some(self.results.len())
+    }
+
     fn instance_load(&self) -> InstanceLoad {
         std::iter::once(self.scheduler.instance_load())
             .chain(

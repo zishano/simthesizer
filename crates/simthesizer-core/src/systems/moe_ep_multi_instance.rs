@@ -487,6 +487,10 @@ impl Module for MoeEpMultiInstanceSystem {
 }
 
 impl System for MoeEpMultiInstanceSystem {
+    fn completed_requests(&self) -> Option<usize> {
+        Some(self.results.len())
+    }
+
     fn instance_load(&self) -> InstanceLoad {
         self.rank_loads()
             .into_iter()

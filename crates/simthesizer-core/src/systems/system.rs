@@ -14,6 +14,11 @@ pub enum SystemEvent {
 pub trait System: Module + LogicalHandler {
     fn init(&mut self) -> Result<()>;
 
+    /// Completed root results retained by this system, excluding forwarded child results.
+    fn completed_requests(&self) -> Option<usize> {
+        None
+    }
+
     /// Scheduler work plus assigned initial LLM calls awaiting enqueue.
     fn instance_load(&self) -> InstanceLoad;
 
