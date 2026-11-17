@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rooflang · 完整调度与计算图</title>
+<style>
+:root{color-scheme:light;--ink:#203047;--muted:#607087;--border:#dce3ec;--p:#2563b4;--d:#7657be;--kv:#137b64;--tp:#c06d15;--active:#ed6031}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;height:100dvh;display:flex;flex-direction:column;overflow:hidden;background:#f4f7fb;color:var(--ink);font:13px system-ui,sans-serif}
+header{flex:none;padding:7px 12px 4px}
+h1{font-size:18px;margin:0}h2{font-size:14px;margin:0}p{line-height:1.5;margin:5px 0}
+small,.muted{color:var(--muted);line-height:1.4;font-size:11px}
+#deployment{font-size:12px;margin:3px 0}#inputInfo{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button,input,select{font:inherit;padding:3px 7px;border:1px solid #c9d3e1;border-radius:4px;background:white;color:var(--ink)}
+button{cursor:pointer}button:hover{background:#eef3fb}button.primary{background:#235ea5;color:white}a{color:#205a9e}
+code,pre{font:12px ui-monospace,monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0}
+.toolbar{flex:none;z-index:5;border-bottom:1px solid var(--border);background:#f4f7fb;padding:5px 12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.toolbar input[type=range]{flex:1;min-width:160px}.toolbar #clock{font:11px ui-monospace,monospace}
+.follow-toggle{display:inline-flex;gap:4px;align-items:center;white-space:nowrap;font-size:12px}.follow-toggle input{margin:0;accent-color:#235ea5}
+main{flex:1;min-height:0;display:grid;grid-template-rows:minmax(0,1fr);padding:8px 12px}
+section{min-width:0;min-height:0;background:white;border:1px solid var(--border);border-radius:7px;padding:8px}
+.row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.spacer{flex:1}.pill{padding:2px 7px;background:#e9eff8;border-radius:20px;font-size:11px}
+#completed{font-size:12px;white-space:nowrap}
+.workspace{min-width:0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,26vw,390px);gap:8px}
+.main-column{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(310px,.95fr) minmax(170px,1.05fr);gap:8px}
+.timeline-panel,.detail-panel{display:flex;flex-direction:column;gap:5px;overflow:hidden}
+.timeline-tools{flex:none}.timeline-tools label{white-space:nowrap;font-size:12px}
+.legend{flex:none;display:flex;gap:12px;flex-wrap:wrap;font-size:11px;line-height:1.5}.legend i{display:inline-block;width:8px;height:8px;margin-right:4px;border-radius:2px}
+.scroll{overflow:auto;min-width:0;min-height:0;scrollbar-gutter:stable}
+#timeline{flex:1;min-height:0}#timeline svg{display:block}svg text{font:12px system-ui,sans-serif}svg [data-node],svg [data-round]{cursor:pointer}
+.hint{flex:none;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.inspector{display:flex;flex-direction:column;padding:0;overflow:hidden}
+.tabs{flex:none;display:flex;gap:2px;overflow:auto;border-bottom:1px solid var(--border);padding:3px 6px;scrollbar-width:thin}
+.tabs button{flex:none;border-color:transparent;background:none;padding:5px 9px;font-size:12px}.tabs button[aria-selected=true]{background:#e9f1fc;color:#205c9f;font-weight:600}
+.tabs #nodeCount{margin-left:auto;align-self:center;white-space:nowrap;padding:0 3px}
+.tab-panel{flex:1;min-height:0;padding:8px;overflow:auto}.tab-panel.stack{display:flex;flex-direction:column;gap:5px;overflow:hidden}
+.module-tools{flex:none;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:10px;color:var(--muted)}#moduleClock{margin-left:auto}
+.module-tools button{font-size:11px;padding:1px 6px}#modules-panel.module-expanded{position:fixed;z-index:6;left:12px;right:12px;bottom:12px;height:min(440px,calc(100dvh - 150px));background:white;border:1px solid var(--border);border-radius:7px;box-shadow:0 8px 30px #1c355b38}
+#moduleFlow{flex:1;min-height:0;overflow:auto}#moduleFlow svg{display:block;width:100%;height:100%;min-height:220px;min-width:710px}
+.module-card{cursor:pointer;outline:none}.module-card .card-bg{fill:#f7f9fc;stroke:#a9bacd;stroke-width:1}
+.module-card text{font-size:10px;fill:#334d68;pointer-events:none}.module-card .module-title{font-size:11px;font-weight:600;fill:#234e7e}.module-card .module-status{font-size:9px;fill:#718096}
+.module-card[data-state=running] .card-bg{fill:#e3f5e9;stroke:#16804b;stroke-width:2}.module-card[data-state=waiting] .card-bg{fill:#fff6e5;stroke:#c47b15;stroke-dasharray:4 2}
+.module-card[data-pulse=true] .card-bg{stroke:#d68a10;stroke-width:2}.module-card[data-state=pulse] .card-bg{fill:#fff4dc}.module-card[data-state=ready] .card-bg{fill:#ecf8f7;stroke:#21958c}
+.module-card[data-state=future],.module-card[data-state=unused]{opacity:.65}.module-card[data-state=in_round] .card-bg{fill:#edf3fc;stroke:#7f9dbe}.module-card:hover .card-bg,.module-card:focus .card-bg{stroke-width:2.5}
+.module-selected{fill:none;stroke:#7864c3;stroke-width:1;stroke-dasharray:3 3;pointer-events:none}
+.module-edge path{fill:none;stroke:#a6b3c3;stroke-width:1.3}.module-edge.control path{stroke-dasharray:4 3}.module-edge.data path{stroke:#1d8e91}
+.module-edge.running path{stroke:#16804b;stroke-width:2.5}.module-edge.pulse path{stroke:#d68a10;stroke-width:2}.module-edge.waiting path{stroke:#c47b15;stroke-width:2}
+.module-edge text{font-size:9px;fill:#687e94;paint-order:stroke;stroke:white;stroke-width:3px;stroke-linejoin:round}
+.filters{flex:none}.filters input{width:155px}.filters select{max-width:130px}.filters #layer{width:80px}
+.pager{flex:none;justify-content:space-between}.pager>span{white-space:nowrap}
+#nodeTable,#dependencies,#kvEvents{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable}
+table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #edf0f5;padding:4px 5px;text-align:left;white-space:nowrap}th{color:#54667b;background:#f5f8fc;position:sticky;top:0}
+td.name{max-width:220px;overflow:hidden;text-overflow:ellipsis}tr[data-node]{cursor:pointer}tr[data-node]:hover{background:#f4f7fc}tr.selected{background:#fff0e9}
+#detail{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;font-size:12px}
+dl{display:grid;grid-template-columns:92px minmax(0,1fr);gap:4px;margin:4px 0 10px}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}
+details{border-top:1px solid #e4e9f0;margin-top:7px;padding-top:6px}summary{cursor:pointer;color:#345c8b}
+#files{display:flex;flex-wrap:wrap;gap:10px}#nodeCount{font-size:11px;color:var(--muted)}.live{color:var(--active);font-weight:600}.empty{color:var(--muted);padding:10px}
+.statebox{padding:5px 7px;background:#f4f7fb;border-radius:4px;margin:4px 0;font-size:12px}footer{color:var(--muted);font-size:12px;line-height:1.6;margin-top:10px}
+@media(min-width:961px) and (min-height:581px) and (max-height:720px){.main-column{grid-template-rows:minmax(165px,.95fr) minmax(170px,1.05fr)}}
+@media(max-width:960px),(max-height:580px){
+ body{height:auto;overflow:auto}main{flex:none;min-height:0}.workspace{grid-template-columns:1fr}.main-column{grid-template-rows:320px 360px}
+ .detail-panel{height:440px}.toolbar{position:sticky;top:0}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="row"><h1>完整调度与计算图</h1><span id="mode" class="pill"></span><span class="spacer"></span><span id="coverage" class="muted"></span></div>
+  <p id="deployment"></p><small id="inputInfo"></small>
+</header>
+<div class="toolbar">
+  <button id="first">起点</button><button id="back">上个时刻</button><button id="play" class="primary">播放</button><button id="next">下个时刻</button><button id="end">结束</button>
+  <label class="follow-toggle" title="统一控制右侧详情和下方节点 / 依赖图。开启时自动定位当前节点；关闭后保留选择和浏览位置，时间线仍可播放。"><input id="follow" type="checkbox" checked>跟随全局时间线</label>
+  <input id="step" aria-label="模拟时间" type="range" min="0" value="0"><span id="clock"></span>
+</div>
+<main>
+  <div class="workspace">
+   <div class="main-column">
+    <section class="timeline-panel">
+    <div class="row timeline-tools"><h2>全局时间线</h2><span id="completed" class="muted"></span><span class="spacer"></span><label>行高 <select id="rowSize"><option value="fit">适应视窗</option><option value="full">展开分片</option></select></label><label>横向 <select id="zoom"><option>1</option><option>2</option><option>4</option><option>8</option><option>16</option><option>32</option></select> ×</label><button id="fit">全程</button><button id="focus">聚焦所选</button></div>
+    <div class="legend"><span><i style="background:var(--p)"></i>P 算子</span><span><i style="background:var(--d)"></i>D 算子</span><span><i style="background:var(--tp)"></i>TP 通信</span><span><i style="background:var(--kv)"></i>KV 传输</span><span><i style="background:var(--active)"></i>执行中</span><span>斜线：显存准入等待；浅色：未来；灰细线：当前时刻</span></div>
+    <div id="timeline" class="scroll"></div>
+    <small class="hint" title="右侧详情和下方节点 / 依赖图统一跟随时间线，取消勾选可自由浏览。时间轴为相对请求到达的毫秒；展开分片可逐条查看并发 KV。">右侧与下方统一跟随时间线；取消勾选可自由浏览。点击条目查看详情，并发 KV 可展开分片。</small>
+    </section>
+    <section class="inspector">
+      <nav class="tabs" role="tablist" aria-label="观测内容">
+        <button id="tab-nodes" role="tab" data-tab="nodes-panel" aria-controls="nodes-panel" aria-selected="true">节点明细</button>
+        <button id="tab-modules" role="tab" data-tab="modules-panel" aria-controls="modules-panel" aria-selected="false">模块数据流</button>
+        <button id="tab-dependencies" role="tab" data-tab="dependency-panel" aria-controls="dependency-panel" aria-selected="false">依赖图</button>
+        <button id="tab-scheduler" role="tab" data-tab="scheduler-panel" aria-controls="scheduler-panel" aria-selected="false">调度 / 显存</button>
+        <button id="tab-kv" role="tab" data-tab="kv-panel" aria-controls="kv-panel" aria-selected="false">KV 生命周期</button>
+        <button id="tab-requests" role="tab" data-tab="requests-panel" aria-controls="requests-panel" aria-selected="false">请求 / Workload</button>
+        <button id="tab-files" role="tab" data-tab="files-panel" aria-controls="files-panel" aria-selected="false">完整记录</button>
+        <span id="nodeCount" title="筛选只作用于节点列表，保留所有轮次；所有原始节点均可翻页查看。"></span>
+      </nav>
+      <div id="nodes-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-nodes">
+        <div class="row filters"><input id="query" placeholder="节点 ID / 算子名"><select id="kind"><option value="">全部类型</option><option value="schedule">调度逻辑</option><option value="boundary">轮次边界</option><option value="operator">计算 / HBM 算子</option><option value="tp">TP 通信</option><option value="kv">KV 传输</option><option value="kv_state">KV 读写 / 确认</option></select><select id="moduleFilter" aria-label="模块筛选"><option value="">全部模块</option></select><select id="instance"><option value="">全部实例</option></select><select id="request"><option value="">全部请求</option></select><input id="layer" type="number" min="0" placeholder="层编号"><button id="clear">清除筛选</button><span class="spacer"></span><span style="white-space:nowrap"><button id="prevPage">上一页</button><span id="page"></span><button id="nextPage">下一页</button></span></div>
+        <div id="nodeTable" class="scroll"></div>
+      </div>
+      <div id="modules-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-modules" hidden>
+        <div class="module-tools"><span>绿色：执行中 · 橙色：本刻事件 · 虚线框：等待</span><span>实线：数据 / 依赖 · 虚线箭头：调度</span><span id="moduleClock"></span><button id="moduleExpand" aria-pressed="false" title="展开此图；全局时间线仍可操作。Esc 收起。">展开</button></div>
+        <div id="moduleFlow"></div>
+        <small class="hint" title="始终显示全局时间线的当前状态。点击模块联动右侧详情和节点筛选；节点筛选不改变模块全局统计。进度按已完成节点、轮次或已确认分片统计。">跟随全局时间线 · 点击模块查看相关节点 · 队列计数不代表 GPU 正在执行</small>
+      </div>
+      <div id="dependency-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-dependencies" hidden>
+        <div class="row"><h2>所选节点的原生依赖</h2><span class="spacer"></span><label><input id="history" type="checkbox" checked>完整依赖历史</label></div>
+        <div class="row pager"><small id="dependencyCount"></small><span><button id="depBack">上一组</button><span id="depPage"></span><button id="depNext">下一组</button></span></div>
+        <div id="dependencies"></div>
+        <small class="hint">前驱 → 后继；虚线：已移除；浅灰：尚未建立。每组左右各 16 个邻居，点击跳转。</small>
+      </div>
+      <div id="scheduler-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-scheduler" hidden><div id="state"></div><div id="memory" class="scroll"></div></div>
+      <div id="kv-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-kv" hidden><div id="kvState"></div><div id="kvEvents" class="scroll"></div><small>接收完成后才可读；P 完成且复制确认后释放源 KV。显存预留与已生成 KV 分开统计。</small></div>
+      <div id="requests-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-requests" hidden><div id="requests" class="scroll"></div><details><summary>本次 workload 原文</summary><pre id="workload"></pre></details></div>
+      <div id="files-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-files" hidden><div id="files"></div><details><summary>GPU 编号图例</summary><pre id="deviceLegend"></pre></details><footer>本页直接读取原生模拟事件，不重算算子时间。基础计算、HBM、网络成本可重叠，不能相加作为执行耗时；超出独占下界的时间也不单独归因为某一种资源。回放将同一时刻的瞬时事件合并，精确顺序见原始动态图。结果属于当前解析模型的仿真预测。</footer></div>
+    </section>
+   </div>
+   <section class="detail-panel"><div class="row"><h2>节点 / 批次详情</h2><span class="spacer"></span><button id="showDependencies">查看依赖</button></div><div id="detail"></div></section>
+  </div>
+</main>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+'use strict';
+const data=JSON.parse(document.getElementById('data').textContent), $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nodes=new Map(data.nodes.map(n=>[n.id,n])), rounds=new Map(data.rounds.map(r=>[r.key,r]));
+const incoming=new Map(),outgoing=new Map();
+for(const e of data.edges){if(!incoming.has(e.child))incoming.set(e.child,[]);if(!outgoing.has(e.parent))outgoing.set(e.parent,[]);incoming.get(e.child).push(e);outgoing.get(e.parent).push(e);}
+const category={schedule:'调度',boundary:'轮次',operator:'算子',tp:'TP',kv:'KV 传输',kv_state:'KV 状态'};
+const color={p:'#2563b4',d:'#7657be',kv:'#137b64',tp:'#c06d15',schedule:'#65758a'};
+const ops=data.nodes.filter(n=>['operator','tp'].includes(n.view.category)), copies=data.nodes.filter(n=>n.view.category==='kv');
+const step=$('step');step.max=data.times.length-1;
+let selected=(ops[0]||data.nodes[0])?.id??null,page=0,depPage=0,timer=null,windowStart=data.meta.origin,windowEnd=data.meta.finish;
+const gpu=d=>'G'+data.devices.indexOf(d), rel=t=>(t-data.meta.origin)*1000;
+const ms=t=>rel(t).toFixed(6), us=t=>(t*1e6).toFixed(4), bytes=n=>n>=1e9?(n/1e9).toFixed(3)+' GB':n>=1e6?(n/1e6).toFixed(3)+' MB':n>=1e3?(n/1e3).toFixed(2)+' KB':n+' B';
+const time=()=>data.times[+step.value];
+function lastAt(array,t,get=x=>x.time_s){let lo=0,hi=array.length;while(lo<hi){const mid=(lo+hi)>>1;if(get(array[mid])<=t)lo=mid+1;else hi=mid;}return array[lo-1];}
+const sequence=()=>lastAt(data.clock,time(),x=>x[0])?.[1]??-1;
+function status(n){const t=time();if(n.time>t)return '尚未创建';if(n.finish<=t)return '已完成';if(n.start<=t)return '执行中';if(n.dispatches.length&&n.dispatches[0][1]<=t)return '等待资源准入';return '等待前驱 / 释放时间';}
+function active(n){return n.start<=time()&&n.finish>time();}
+function nodeColor(n){return color[n.view.category==='tp'?'tp':n.view.module]||color.schedule;}
+function selectNode(id,list=filtered()){
+ if(selected!==id){selected=id;depPage=0;}
+ const index=list.findIndex(n=>n.id===id);if(index>=0)page=Math.floor(index/60);
+}
+function revealSelected(){
+ const outer=$('nodeTable'),row=outer.querySelector('tr.selected');if(!row||!outer.clientHeight)return;
+ const box=outer.getBoundingClientRect(),item=row.getBoundingClientRect(),top=box.top+outer.querySelector('thead').getBoundingClientRect().height;
+ if(item.top<top)outer.scrollTop+=item.top-top;else if(item.bottom>box.bottom)outer.scrollTop+=item.bottom-box.bottom;
+}
+function currentNode(list){
+ let running=null,finished=null;
+ for(const n of list){
+  if(active(n)){if(!running||n.id===selected||(running.id!==selected&&n.start>running.start))running=n;}
+  else if(n.finish<=time()&&(!finished||n.finish>finished.finish||(n.finish===finished.finish&&n.id>finished.id)))finished=n;
+ }
+ return (running||finished)?.id??null;
+}
+function timelineChanged(){
+ if($('follow').checked){const list=filtered();selectNode(currentNode(list),list);}
+ render();if($('follow').checked)revealSelected();
+}
+function choose(id,jump=false){id=Number(id);if(jump){setTime(nodes.get(id).start,id);return;}selectNode(id);render();revealSelected();}
+function setTime(t,id=null){let lo=0,hi=data.times.length;while(lo<hi){const m=(lo+hi)>>1;if(data.times[m]<=t)lo=m+1;else hi=m;}step.value=Math.max(0,lo-1);if(id===null)timelineChanged();else choose(id);}
+function buttons(root){root.querySelectorAll('[data-node]').forEach(el=>el.onclick=()=>choose(el.dataset.node,el.dataset.jump==='yes'));}
+function compact(n){let name=n.view.name.replace('RooflangRoundBegin','批次准入').replace('RooflangRoundEnd','轮次完成').replace('KV Some(','KV ').replace(/ \{.*$/,'');return name.length>30?name.slice(0,29)+'…':name;}
+function makeLanes(){
+ const lanes=[];
+ for(const side of ['p','kv','d']){
+  if(side==='kv'){
+   const paths=new Map();for(const n of copies){const d=n.details.work.details,key=d.src+' → '+d.dst;if(!paths.has(key))paths.set(key,[]);paths.get(key).push(n);}
+   for(const [key,list] of paths){const [src,dst]=key.split(' → '),ends=[],items=[];for(const n of [...list].sort((a,b)=>a.start-b.start||a.id-b.id)){let track=ends.findIndex(e=>e<=n.start);if(track<0)track=ends.length;ends[track]=n.finish;items.push({n,track});}lanes.push({label:`KV ${gpu(src)} → ${gpu(dst)}`,title:key,items,height:Math.max(28,ends.length*7+8),tracks:ends.length});}
+   continue;
+  }
+  for(const i of data.instances.filter(i=>i.side===side)){
+   lanes.push({label:`${i.id} · batch`,rounds:data.rounds.filter(r=>r.instance===i.id),height:30});
+   for(const device of i.devices)lanes.push({label:`${i.id} / ${gpu(device)} · 算子`,title:device,items:ops.filter(n=>n.view.instance===i.id&&n.view.category==='operator'&&n.view.devices.includes(device)).map(n=>({n,track:0})),height:28,tracks:1});
+   lanes.push({label:`${i.id} · TP 通信`,items:ops.filter(n=>n.view.instance===i.id&&n.view.category==='tp').map(n=>({n,track:0})),height:25,tracks:1});
+  }
+ }
+ return lanes;
+}
+const lanes=makeLanes();
+function renderTimeline(){
+ const outer=$('timeline'),zoom=Number($('zoom').value),width=Math.max(620,outer.clientWidth-1)*zoom,left=125,right=38,span=Math.max(1e-12,windowEnd-windowStart),x=t=>left+(t-windowStart)/span*(width-left-right);
+ const fitHeight=Math.max(18,(outer.getBoundingClientRect().height-(zoom>1?18:0)-34)/Math.max(1,lanes.length));
+ const shown=lanes.map(l=>({...l,height:$('rowSize').value==='fit'?fitHeight:l.height}));
+ const height=34+shown.reduce((s,l)=>s+l.height,0),t=time();
+ let svg=`<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><defs><pattern id="wait" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" fill="#eef0f5"/><line x1="0" y1="0" x2="0" y2="5" stroke="#9aabbe" stroke-width="2"/></pattern><clipPath id="plotClip"><rect x="${left}" y="0" width="${width-left-right+1}" height="${height}"/></clipPath></defs>`;
+ for(let i=0;i<=8;i++){const a=windowStart+span*i/8,at=x(a);svg+=`<line x1="${at}" x2="${at}" y1="26" y2="${height-12}" stroke="#e6ecf3"/><text x="${at}" y="18" text-anchor="middle" fill="#67798f">${rel(a).toFixed(3)} ms</text>`;}
+ let y=27;
+ for(const lane of shown){const barHeight=Math.min(22,lane.height-5),middle=y+lane.height/2;svg+=`<text x="4" y="${middle+4}" fill="#465e78"><title>${esc(lane.title||lane.label)}</title>${esc(lane.label)}</text><line x1="${left}" x2="${width-right}" y1="${y+lane.height}" y2="${y+lane.height}" stroke="#f0f3f8"/><g clip-path="url(#plotClip)">`;
+  for(const r of lane.rounds||[]){if(r.finish<windowStart||r.queued>windowEnd)continue;const yy=middle-barHeight/2;if(r.start>r.queued)svg+=`<rect x="${x(r.queued)}" y="${yy}" width="${Math.max(.8,x(r.start)-x(r.queued))}" height="${barHeight}" fill="url(#wait)" data-node="${r.begin}" data-jump="yes"><title>显存准入等待 ${us(r.start-r.queued)} µs</title></rect>`;const w=Math.max(.8,x(r.finish)-x(r.start));svg+=`<g data-node="${r.begin}" data-jump="yes"><rect x="${x(r.start)}" y="${yy}" width="${w}" height="${barHeight}" rx="3" fill="${color[r.side]}" opacity="${r.start>t?.14:.75}" stroke="${r.start<=t&&r.finish>t?'#ed6031':color[r.side]}" stroke-width="${r.start<=t&&r.finish>t?2.5:1}"/><title>${esc(r.key)} · batch ${r.batch.length} · 请求 ${r.requests.join(', ')} · ${us(r.finish-r.start)} µs</title>${w>90?`<text x="${x(r.start)+5}" y="${middle+4}" fill="${r.start>t?'#53667d':'white'}">轮 ${r.round} · B=${r.batch.length} · Q=${r.batch.reduce((s,b)=>s+b.q_len,0)}</text>`:''}</g>`;}
+  for(const {n,track} of lane.items||[]){if(n.finish<windowStart||n.start>windowEnd)continue;const pitch=(lane.height-6)/Math.max(1,lane.tracks),h=lane.tracks>1?Math.max(.35,pitch*.72):Math.min(16,lane.height-5),yy=lane.tracks>1?y+3+track*pitch:middle-h/2,w=Math.max(.8,x(n.finish)-x(n.start));svg+=`<rect data-node="${n.id}" data-jump="yes" x="${x(n.start)}" y="${yy}" width="${w}" height="${h}" rx="1" fill="${nodeColor(n)}" fill-opacity="${n.start>t?.16:n.finish<=t?.6:1}" stroke="${active(n)?'#ed6031':n.id===selected?'#142b45':'none'}" stroke-width="${active(n)?2:1.4}"><title>#${n.id} ${esc(n.view.name)} | ${ms(n.start)} → ${ms(n.finish)} ms | ${us(n.finish-n.start)} µs</title></rect>`;}
+  svg+='</g>';y+=lane.height;
+ }
+ if(t>=windowStart&&t<=windowEnd)svg+=`<line x1="${x(t)}" x2="${x(t)}" y1="25" y2="${height-7}" stroke="#31445c" stroke-width="1" pointer-events="none"/>`;
+ outer.innerHTML=svg+'</svg>';buttons(outer);
+ outer.querySelector('svg').onclick=e=>{if(e.target.closest('[data-node]'))return;const rect=e.currentTarget.getBoundingClientRect(),px=e.clientX-rect.left;if(px>=left&&px<=width-right)setTime(windowStart+(px-left)/(width-left-right)*span);};
+}
+function renderState(){
+ const snapshot=lastAt(data.states,time()),state=snapshot?.state||{};
+ $('state').innerHTML=data.instances.map(i=>{const pool=data.instances.filter(j=>j.side===i.side),index=pool.findIndex(j=>j.id===i.id),s=state[i.side==='p'?'prefill_instances':'decode_instances']?.[index]?.scheduler;return `<div class="statebox"><b>${esc(i.id)}</b> · 队列 ${s?.waiting_requests??'—'} · 已接纳未完成 ${s?.running_requests??'—'} · 已提交输出 token ${s?.generation_tokens_total??'—'}</div>`;}).join('')+'<small>已接纳未完成包含等待 KV / 资源的请求；GPU 是否正在执行以时间线为准。</small>';
+ const mem=lastAt(data.memory,time())?.state;
+ if(mem){let rows='';for(const device of data.devices){const g={weights:0,kv:0,workspace:0};for(const [id,a] of Object.entries(mem.allocations)){const kind=id.split(':')[0];g[kind]=(g[kind]||0)+(a.bytes[device]||0);}rows+=`<tr><td>${gpu(device)}</td><td>${bytes(g.weights)}</td><td>${bytes(g.kv)}</td><td>${bytes(g.workspace)}</td><td>${bytes(mem.capacity_bytes[device]||0)}</td></tr>`;}$('memory').innerHTML='<table><tr><th>GPU</th><th>权重</th><th>KV 预留</th><th>工作区</th><th>可用容量</th></tr>'+rows+'</table>';}else $('memory').textContent='当前无显存快照。';
+ const events=data.kv.filter(e=>e.time_s<=time()),live=new Map();for(const e of events){if(e.transition==='release')live.delete(e.block.id);else live.set(e.block.id,e.block);}
+ let ready=0,flight=0;for(const b of live.values()){if(b.state==='in_flight')flight+=b.bytes;else ready+=b.bytes;}
+ $('kvState').innerHTML=`<p>已就绪 ${bytes(ready)} · 传输中 ${bytes(flight)} · 活动块 ${live.size}</p>`;
+ const transition={produce:'生成',extend:'追加',send:'开始复制',receive:'接收完成',release:'释放'};
+ $('kvEvents').innerHTML='<table><tr><th>最近 12 条事件</th><th>请求 / 层 / 块</th><th>位置</th><th>相对 ms</th></tr>'+events.slice(-12).reverse().map(e=>`<tr><td>${esc(transition[e.transition]||e.transition)}</td><td>#${e.block.request} / L${e.block.layer} / ${e.block.id}</td><td>${gpu(e.block.device)}</td><td>${ms(e.time_s)}</td></tr>`).join('')+'</table>';
+}
+function filtered(){const q=$('query').value.trim().toLowerCase().replace(/^#/,''),kind=$('kind').value,i=$('instance').value,r=$('request').value,layer=$('layer').value,module=$('moduleFilter').value;return data.nodes.filter(n=>(!q||(n.id+' '+n.view.name).toLowerCase().includes(q))&&(!kind||n.view.category===kind)&&(!module||n.view.flow===module)&&(!i||n.view.instance===i)&&(r===''||n.view.requests.includes(Number(r)))&&(layer===''||n.view.layer===Number(layer)));}
+function renderTable(){
+ const list=filtered(),pages=Math.max(1,Math.ceil(list.length/60));page=Math.max(0,Math.min(page,pages-1));$('page').textContent=` ${page+1} / ${pages} `;$('nodeCount').textContent=`筛选 ${list.length} / 全部 ${data.nodes.length} 个节点（无采样）`;
+ const outer=$('nodeTable'),shown=list.slice(page*60,(page+1)*60),key=shown.map(n=>n.id).join(',');
+ if(outer.dataset.rows!==key){
+  outer.dataset.rows=key;outer.innerHTML='<table><thead><tr><th>ID</th><th>类型</th><th>实例 / 轮</th><th>名称</th><th>开始 ms</th><th>结束 ms</th><th>耗时 µs</th><th>准入 µs</th><th>状态</th></tr></thead><tbody>'+shown.map(n=>`<tr data-node="${n.id}"><td>#${n.id}</td><td>${category[n.view.category]}</td><td>${esc(n.view.instance??'—')} / ${n.view.round??'—'}</td><td class="name" title="${esc(n.view.name)}">${esc(n.view.name)}</td><td>${ms(n.start)}</td><td>${ms(n.finish)}</td><td>${us(n.finish-n.start)}</td><td>${n.details.kind==='resource'?us(n.start-(n.dispatches[0]?.[1]??n.start)):'—'}</td><td data-status></td></tr>`).join('')+'</tbody></table>';outer.scrollTop=0;buttons(outer);
+ }
+ for(const row of outer.querySelectorAll('tbody tr')){const n=nodes.get(Number(row.dataset.node)),cell=row.querySelector('[data-status]');row.classList.toggle('selected',n.id===selected);cell.textContent=status(n);cell.classList.toggle('live',active(n));}
+}
+function renderDetails(){
+ const outer=$('detail'),n=nodes.get(selected);if(!n){delete outer.dataset.nodeId;outer.textContent='筛选范围内尚无已执行节点，可取消跟随后自由选择。';return;}
+ if(outer.dataset.nodeId===String(n.id)){const cell=outer.querySelector('[data-status]');cell.textContent=status(n);cell.classList.toggle('live',active(n));return;}
+ const d=n.details.work?.details||{},r=rounds.get(`${n.view.instance}/${n.view.round}`),queued=n.dispatches[0]?.[1];
+ const fields=[['节点',`#${n.id} · ${category[n.view.category]}`],['名称',n.view.name],['当前状态',status(n)],['实例 / 轮',`${n.view.instance??'未标注'} / ${n.view.round??'—'}`],['层编号',n.view.layer??'—'],['请求',n.view.requests.join(', ')||'—'],['GPU',n.view.devices.map(gpu).join(', ')||'—'],['创建时刻',`${n.time.toFixed(12)} s`],['开始时刻',`${n.start.toFixed(12)} s`],['结束时刻',`${n.finish.toFixed(12)} s`],['执行耗时',`${us(n.finish-n.start)} µs`]];
+ if(n.details.kind==='resource')fields.push(['就绪 / dispatch',`${queued?.toFixed(12)} s`],['资源准入等待',`${us(n.start-queued)} µs`],['独占服务下界',`${us(n.view.base_s)} µs`],['超出下界',`${us(Math.max(0,n.finish-n.start-n.view.base_s))} µs`]);
+ for(const [k,label] of [['compute_us','计算基础成本'],['memory_us','HBM 基础成本'],['network_us','网络基础成本']])if(k in d)fields.push([label,`${Number(d[k]).toFixed(6)} µs`]);
+ for(const [k,label] of [['weight_bytes','读取权重'],['input_bytes','输入数据'],['output_bytes','输出数据'],['bytes','KV 数据量']])if(k in d)fields.push([label,bytes(d[k])]);
+ if('flops' in d)fields.push(['FLOPs',d.flops.toLocaleString()]);
+ if(d.src)fields.push(['KV 路径',`${gpu(d.src)} → ${gpu(d.dst)}`],['KV 区间',`tokens [${d.token_start},${d.token_end}) · heads [${d.head_start},${d.head_end})`]);
+ let body='<dl>'+fields.map(([k,v])=>`<dt>${esc(k)}</dt><dd${k==='当前状态'?` data-status class="${active(n)?'live':''}"`:''}>${esc(v)}</dd>`).join('')+'</dl><div class="row"><button id="jumpTime">跳到开始</button>'+(n.cause===null?'':`<button data-node="${n.cause}">创建者 #${n.cause}</button>` )+'</div>';
+ if(r)body+=`<details open><summary>本轮 batch=${r.batch.length} · ${esc(r.key)}</summary><p>开始 ${ms(r.start)} ms · 结束 ${ms(r.finish)} ms</p><table><tr><th>请求</th><th>Q tokens</th><th>已有 KV</th><th>Logits 行</th></tr>${r.batch.map((b,i)=>`<tr><td>#${r.requests[i]}</td><td>${b.q_len}</td><td>${b.kv_len}</td><td>${b.lm_head_len}</td></tr>`).join('')}</table><div class="row"><button data-node="${r.begin}">准入 #${r.begin}</button><button data-node="${r.end}">完成 #${r.end}</button></div></details>`;
+ if(d.inputs||d.outputs)body+=`<details open><summary>张量形状</summary><pre>${esc(JSON.stringify({inputs:d.inputs,outputs:d.outputs},null,2))}</pre></details>`;
+ if(n.details.work)body+=`<details><summary>物理资源 / 内存预留</summary><pre>${esc(JSON.stringify({demands:n.details.work.demands,slots:n.details.work.slots,reserve:n.details.work.reserve,release:n.details.work.release},null,2))}</pre></details>`;
+ body+=`<details><summary>原生节点完整记录</summary><pre>${esc(JSON.stringify(n,null,2))}</pre></details>`;outer.innerHTML=body;outer.dataset.nodeId=String(n.id);outer.scrollTop=0;buttons(outer);$('jumpTime').onclick=()=>setTime(n.start);
+}
+function renderDependencies(){
+ const outer=$('dependencies'),n=nodes.get(selected);if(!n){outer.textContent='当前没有选中节点。';$('dependencyCount').textContent='';$('depPage').textContent=' 1/1 ';return;}const seq=sequence(),history=$('history').checked,keep=e=>history||(e.added<=seq&&(e.removed===null||e.removed>seq));
+ const before=(incoming.get(n.id)||[]).filter(keep),after=(outgoing.get(n.id)||[]).filter(keep),pages=Math.max(1,Math.ceil(Math.max(before.length,after.length)/16));depPage=Math.max(0,Math.min(depPage,pages-1));$('depPage').textContent=` ${depPage+1}/${pages} `;$('dependencyCount').textContent=`#${n.id} · 前驱 ${before.length} · 后继 ${after.length}`;
+ const a=before.slice(depPage*16,(depPage+1)*16),b=after.slice(depPage*16,(depPage+1)*16),height=Math.max(90,Math.max(a.length,b.length)*42+16),cy=height/2;
+ const width=Math.max(620,$('dependencies').clientWidth-1),boxWidth=(width-96)/3,x=i=>6+i*(boxWidth+42);
+ let svg=`<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><defs><marker id="depArrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6" fill="#8495aa"/></marker></defs>`;
+ const box=(id,xx,y)=>{const v=nodes.get(id),c=nodeColor(v),limit=Math.floor((boxWidth-16)/7),label=compact(v);return `<g data-node="${id}"><rect x="${xx}" y="${y-17}" width="${boxWidth}" height="34" rx="5" fill="${id===selected?'#fff1e9':'#f6f8fc'}" stroke="${active(v)?'#ed6031':c}" stroke-width="${id===selected?2:1}"/><text x="${xx+8}" y="${y-3}" fill="#263e58">#${id} · ${category[v.view.category]} · ${esc(v.view.instance||'')}</text><text x="${xx+8}" y="${y+11}" fill="#57708b">${esc(label.length>limit?label.slice(0,limit-1)+'…':label)}</text><title>${esc(v.view.name)}</title></g>`;};
+ for(const [edges,left] of [[a,true],[b,false]])edges.forEach((e,i)=>{const y=25+i*42,removed=e.removed!==null&&e.removed<=seq,future=e.added>seq,sx=left?x(0)+boxWidth:x(1)+boxWidth,ex=left?x(1):x(2),sy=left?y:cy,ey=left?cy:y;svg+=`<path d="M${sx} ${sy} C${sx+21} ${sy} ${ex-21} ${ey} ${ex} ${ey}" fill="none" stroke="${future?'#dce3ec':removed?'#b69a83':'#8495aa'}" ${removed||future?'stroke-dasharray="4 3"':''} marker-end="url(#depArrow)"><title>建立序号 ${e.added} · 移除 ${e.removed??'无'}</title></path>`;svg+=box(left?e.parent:e.child,x(left?0:2),y);});
+ svg+=box(n.id,x(1),cy);const top=outer.scrollTop,left=outer.scrollLeft;outer.innerHTML=svg+'</svg>';outer.scrollTop=top;outer.scrollLeft=left;buttons(outer);
+}
+__MODULE_FLOW__
+const flowModel=new ModuleFlowModel(data);
+for(const [key,label] of Object.entries(FLOW_LABELS))$('moduleFilter').add(new Option(label,key));
+$('moduleExpand').onclick=toggleModuleSize;
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('modules-panel').classList.contains('module-expanded'))toggleModuleSize();});
+function render(){const t=time();$('clock').textContent=`+${ms(t)} ms · t=${t.toFixed(9)} s`;$('step').title=`${+step.value+1}/${data.times.length} 个事件时刻`;$('completed').textContent=`请求完成 ${flowBound(flowModel.finishes,t,r=>r.finish)}/${data.requests.length}`;renderTimeline();renderState();renderTable();renderDetails();renderDependencies();renderModules();}
+$('mode').textContent=`shared · ${data.meta.mode==='layer'?'逐层交接 layer':'整轮交接 whole'}`;
+$('coverage').textContent=`${data.nodes.length} 节点 · ${data.edges.length} 条历史依赖 · ${data.rounds.length} 轮`;
+$('deployment').textContent=data.instances.map(i=>`${i.id}：${i.gpu_model.toUpperCase()} × ${i.devices.length}，TP=${i.tp}，${i.devices.map(gpu).join('/') }，token_budget=${i.scheduler.max_num_batched_tokens}`).join('；');
+$('inputInfo').textContent=`Workload：${data.meta.directory}/workload.jsonl · ${data.requests.length} 个请求 · ${data.meta.model.num_hidden_layers} 层 · 时间原点 ${data.meta.origin} s`;
+$('mode').title=data.meta.mode==='layer'?'逐层交接：P 的 attention 写完一层 KV 即可开始复制，与后续 P 计算重叠。D 在首 token 后开始调度，各层 attention 等待对应 KV。':'整轮交接：P 完成后启动各层 KV 分片复制。D 在首 token 后开始调度，各层 attention 仍按本层 KV 的就绪条件执行。';
+$('inputInfo').title=$('inputInfo').textContent;
+for(const i of data.instances)$('instance').add(new Option(i.id,i.id));for(const r of data.requests)$('request').add(new Option('#'+r.id,String(r.id)));
+$('requests').innerHTML='<table><tr><th>请求</th><th>输入 / 输出 tokens</th><th>到达 s</th><th>P / D 实例</th><th>TTFT ms</th><th>首个 decode 间隔 ms</th><th>端到端 ms</th><th>各 token 输出时刻（相对 ms）</th></tr>'+data.requests.map(r=>`<tr><td>#${r.id}</td><td>${r.input} / ${r.output}</td><td>${r.arrival}</td><td>${esc([...new Set(data.rounds.filter(x=>x.requests.includes(r.id)).map(x=>x.instance))].join(' / '))}</td><td>${r.tokens.length?((r.tokens[0]-r.arrival)*1000).toFixed(6):'—'}</td><td>${r.tokens.length>1?((r.tokens[1]-r.tokens[0])*1000).toFixed(6):'—'}</td><td>${((r.finish-r.arrival)*1000).toFixed(6)}</td><td>${r.tokens.map(ms).join('，')}</td></tr>`).join('')+'</table>';
+$('workload').textContent=JSON.stringify(data.meta.workload,null,2);$('deviceLegend').textContent=data.devices.map((d,i)=>`G${i} = ${d}`).join('\n');
+const labels={'index.html':'报告首页','outer.html':'原始动态图（逐事件）','outer.jsonl':'全部原生事件','state.jsonl':'系统状态','config.toml':'运行参数','workload.jsonl':'Workload','result.jsonl':'请求结果','rounds.csv':'全部轮次','operator-costs.csv':'算子成本','kv-transfers.csv':'KV 传输','kv-lifecycle.csv':'KV 生命周期','memory-usage.csv':'显存','shared-check.json':'一致性检查'};
+$('files').innerHTML=Object.entries(data.links).map(([name,path])=>`<a href="${esc(path)}">${esc(labels[name]||name)}</a>`).join('');
+step.oninput=timelineChanged;$('follow').onchange=()=>{if($('follow').checked)timelineChanged();};$('back').onclick=()=>{step.value=Math.max(0,+step.value-1);timelineChanged();};$('next').onclick=()=>{step.value=Math.min(+step.max,+step.value+1);timelineChanged();};$('first').onclick=()=>{step.value=0;timelineChanged();};$('end').onclick=()=>{step.value=step.max;timelineChanged();};
+$('play').onclick=()=>{if(timer){clearInterval(timer);timer=null;$('play').textContent='播放';}else{if(+step.value===+step.max){step.value=0;timelineChanged();}timer=setInterval(()=>{step.value=Math.min(+step.max,+step.value+Math.max(1,Math.floor(data.times.length/180)));timelineChanged();if(+step.value===+step.max)$('play').click();},160);$('play').textContent='暂停';}};
+for(const id of ['query','kind','instance','request','layer','moduleFilter'])$(id).oninput=()=>{page=0;timelineChanged();};$('clear').onclick=()=>{for(const id of ['query','kind','instance','request','layer','moduleFilter'])$(id).value='';page=0;timelineChanged();};
+$('prevPage').onclick=()=>{page--;renderTable();};$('nextPage').onclick=()=>{page++;renderTable();};$('history').onchange=()=>{depPage=0;renderDependencies();};$('depBack').onclick=()=>{depPage--;renderDependencies();};$('depNext').onclick=()=>{depPage++;renderDependencies();};
+function activateTab(id){for(const panel of document.querySelectorAll('.tab-panel'))panel.hidden=panel.id!==id;for(const tab of document.querySelectorAll('[data-tab]')){const on=tab.dataset.tab===id;tab.setAttribute('aria-selected',on);tab.tabIndex=on?0:-1;}$('nodeCount').hidden=id!=='nodes-panel';if(id==='dependency-panel')renderDependencies();if(id==='modules-panel')renderModules();if(id==='nodes-panel'&&$('follow').checked)revealSelected();}
+const tabs=[...document.querySelectorAll('[data-tab]')];tabs.forEach((tab,i)=>{tab.onclick=()=>activateTab(tab.dataset.tab);tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const index=e.key==='Home'?0:e.key==='End'?tabs.length-1:(i+(e.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;activateTab(tabs[index].dataset.tab);tabs[index].focus();};});
+$('showDependencies').onclick=()=>activateTab('dependency-panel');activateTab('nodes-panel');
+$('rowSize').onchange=renderTimeline;$('zoom').onchange=renderTimeline;$('fit').onclick=()=>{windowStart=data.meta.origin;windowEnd=data.meta.finish;$('zoom').value='1';renderTimeline();};
+$('focus').onclick=()=>{const n=nodes.get(selected);if(!n)return;const r=rounds.get(`${n.view.instance}/${n.view.round}`);windowStart=r?.queued??n.start;windowEnd=r?.finish??n.finish;const pad=Math.max((windowEnd-windowStart)*.04,1e-9);windowStart-=pad;windowEnd+=pad;$('zoom').value='1';renderTimeline();};
+let resizeTimer;window.onresize=()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{renderTimeline();renderDependencies();},150);};timelineChanged();
+</script>
+</body>
+</html>
