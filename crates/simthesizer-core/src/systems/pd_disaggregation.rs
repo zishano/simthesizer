@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::engine::Graph;
 use crate::model::Model;
@@ -17,13 +18,23 @@ use crate::types::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PdDisaggregationSystem {
+    #[serde(default)]
+    shared_execution: bool,
+    #[serde(default)]
+    allow_gpu_sharing: bool,
+    #[serde(default = "layer_handoff")]
+    kv_handoff: String,
     prefill_instances: Vec<Box<dyn System>>,
     decode_instances: Vec<Box<dyn System>>,
     model: Box<dyn Model>,
     tp: u32,
     network_sim: Box<dyn NetworkSimulator>,
-    link_bw: f64,
-    link_latency: f64,
+    #[serde(default)]
+    link_bw: Option<f64>,
+    #[serde(default)]
+    link_latency: Option<f64>,
+    #[serde(default)]
+    kv_topology: Option<KvTopology>,
 
     #[serde(skip_deserializing, default)]
     prefill_device_ids: Vec<NetworkDeviceID>,
@@ -42,6 +53,113 @@ pub struct PdDisaggregationSystem {
 
     #[serde(skip_deserializing, default)]
     results: Vec<RequestResult>,
+}
+
+/// Device and link indices refer to insertion order in the parent network simulator.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct KvTopology {
+    devices: Vec<String>,
+    links: Vec<KvLink>,
+    routes: Vec<KvRoute>,
+    shards: u32,
+    prefill_gpus: Vec<Vec<usize>>,
+    decode_gpus: Vec<Vec<usize>>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct KvLink {
+    #[serde(default)]
+    resource: Option<String>,
+    src: usize,
+    dst: usize,
+    bandwidth: f64,
+    latency: f64,
+}
+
+fn layer_handoff() -> String {
+    "layer".into()
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct KvRoute {
+    src: usize,
+    dst: usize,
+    links: Vec<usize>,
+}
+
+impl KvTopology {
+    fn validate(&self, p: usize, d: usize, allow_gpu_sharing: bool) -> Result<()> {
+        if self.shards == 0 || self.prefill_gpus.len() != p || self.decode_gpus.len() != d {
+            bail!("KV topology pool dimensions or shard count invalid");
+        }
+        let mut names = HashSet::new();
+        if self
+            .devices
+            .iter()
+            .any(|name| name.is_empty() || !names.insert(name))
+        {
+            bail!("KV topology device names must be unique and nonempty");
+        }
+        let mut allocated = HashSet::new();
+        for group in self.prefill_gpus.iter().chain(&self.decode_gpus) {
+            let mut local = HashSet::new();
+            if group.is_empty() || self.shards as usize % group.len() != 0 {
+                bail!("KV shards must divide evenly across each TP group");
+            }
+            for &gpu in group {
+                if gpu >= self.devices.len()
+                    || !local.insert(gpu)
+                    || (!allocated.insert(gpu) && !allow_gpu_sharing)
+                {
+                    bail!("KV topology allocations must be disjoint valid device IDs");
+                }
+            }
+        }
+        for link in &self.links {
+            if link.src >= self.devices.len()
+                || link.dst >= self.devices.len()
+                || link.src == link.dst
+            {
+                bail!("KV topology link endpoint invalid");
+            }
+        }
+        let mut pairs = HashSet::new();
+        for route in &self.routes {
+            if route.src >= self.devices.len()
+                || route.dst >= self.devices.len()
+                || !pairs.insert((route.src, route.dst))
+            {
+                bail!("KV topology route endpoints invalid or duplicated");
+            }
+        }
+        for &src in self.prefill_gpus.iter().flatten() {
+            for &dst in self.decode_gpus.iter().flatten() {
+                if !pairs.contains(&(src, dst)) {
+                    bail!("missing KV topology route");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn slices(&self, prefill: usize, decode: usize) -> Vec<(usize, usize, u32, u32)> {
+        let source = &self.prefill_gpus[prefill];
+        let target = &self.decode_gpus[decode];
+        let source_width = self.shards / source.len() as u32;
+        let target_width = self.shards / target.len() as u32;
+        let mut slices = Vec::new();
+        for (p, &src) in source.iter().enumerate() {
+            for (d, &dst) in target.iter().enumerate() {
+                let start = (p as u32 * source_width).max(d as u32 * target_width);
+                let end = ((p as u32 + 1) * source_width).min((d as u32 + 1) * target_width);
+                if start < end {
+                    slices.push((src, dst, start, end));
+                }
+            }
+        }
+        slices
+    }
 }
 
 crate::register_system!(PdDisaggregationSystem, "pd_disaggregation");
@@ -66,7 +184,14 @@ struct LlmTokenData<'a> {
 
 #[derive(Debug)]
 enum LogicalPayload {
-    TransferComplete { request_id: u64 },
+    TransferComplete {
+        request_id: u64,
+    },
+    KvSlice {
+        request_id: u64,
+        head_start: u32,
+        head_end: u32,
+    },
 }
 
 enum HandlerPayload {
@@ -352,6 +477,24 @@ impl PdDisaggregationSystem {
                 }
             };
 
+            if self.shared_execution {
+                graph.kv_event(crate::kv::Event::PrefillDone(request_id), current)?;
+                if let Some(decode_request) = decode_request {
+                    let pending = self.pending_requests.get_mut(&request_id).unwrap();
+                    pending.prefill_result = Some((result, now));
+                    pending.decode_request = Some(decode_request.clone());
+                    let index = pending.decode_instance.unwrap();
+                    let sink = self as *mut Self as *mut dyn LogicalHandler;
+                    self.decode_instances[index].add_request_arrival(
+                        decode_request,
+                        graph,
+                        Some(current),
+                        Some(sink),
+                    )?;
+                    return Ok(0.0);
+                }
+            }
+
             if let Some(decode_request) = decode_request {
                 let decode_instance = self.choose_decode_instance()?;
                 let prefill_instance = {
@@ -370,20 +513,49 @@ impl PdDisaggregationSystem {
                 pending.decode_instance = Some(decode_instance);
 
                 let transfer_tokens = prefill_request.total_input_tokens();
-                let transfer_bytes = u64::from(transfer_tokens)
-                    .saturating_mul(self.model.kv_bytes_per_token_per_device());
-                let transfer = graph.add_network_node(
-                    self.network_sim_ptr(),
-                    self.prefill_device_ids[prefill_instance],
-                    self.decode_device_ids[decode_instance],
-                    transfer_bytes,
-                );
-                graph.add_edge(current, transfer)?;
                 let transfer_complete = graph.add_logical_node(
                     self as *mut Self as *mut dyn LogicalHandler,
                     LogicalPayload::TransferComplete { request_id },
                 );
-                graph.add_edge(transfer, transfer_complete)?;
+                if let Some(topology) = &self.kv_topology {
+                    let slices = topology.slices(prefill_instance, decode_instance);
+                    let bytes_per_head =
+                        self.model.kv_bytes_per_token_per_device() / u64::from(topology.shards);
+                    for (src, dst, head_start, head_end) in slices {
+                        let bytes = u64::from(transfer_tokens)
+                            .checked_mul(bytes_per_head)
+                            .and_then(|v| v.checked_mul(u64::from(head_end - head_start)))
+                            .ok_or_else(|| anyhow!("KV transfer size overflow"))?;
+                        let marker = graph.add_logical_node(
+                            self as *mut Self as *mut dyn LogicalHandler,
+                            LogicalPayload::KvSlice {
+                                request_id,
+                                head_start,
+                                head_end,
+                            },
+                        );
+                        graph.add_edge(current, marker)?;
+                        let transfer = graph.add_network_node(
+                            self.network_sim_ptr(),
+                            src as u64,
+                            dst as u64,
+                            bytes,
+                        );
+                        graph.add_edge(marker, transfer)?;
+                        graph.add_edge(transfer, transfer_complete)?;
+                    }
+                } else {
+                    let transfer_bytes = u64::from(transfer_tokens)
+                        .saturating_mul(self.model.kv_bytes_per_token_per_device());
+                    let transfer = graph.add_network_node(
+                        self.network_sim_ptr(),
+                        self.prefill_device_ids[prefill_instance],
+                        self.decode_device_ids[decode_instance],
+                        transfer_bytes,
+                    );
+                    graph.add_edge(current, transfer)?;
+                    graph.add_edge(transfer, transfer_complete)?;
+                }
                 return Ok(0.0);
             }
 
@@ -408,6 +580,10 @@ impl PdDisaggregationSystem {
             bail!(
                 "pd_disaggregation received mismatched completion payload for request {request_id}"
             );
+        }
+
+        if self.shared_execution {
+            graph.kv_event(crate::kv::Event::DecodeDone(request_id), current)?;
         }
 
         let pending = self
@@ -471,6 +647,14 @@ impl LogicalHandler for PdDisaggregationSystem {
         graph: &mut Graph,
     ) -> Result<f64> {
         match parse_payload(payload)? {
+            HandlerPayload::Internal(LogicalPayload::KvSlice {
+                request_id,
+                head_start,
+                head_end,
+            }) => {
+                let _ = (request_id, head_start, head_end); // Metadata-only event; the network node owns cost.
+                Ok(0.0)
+            }
             HandlerPayload::Internal(LogicalPayload::TransferComplete { request_id }) => {
                 self.handle_transfer_complete(request_id, current, graph)
             }
@@ -503,6 +687,16 @@ impl Module for PdDisaggregationSystem {
 }
 
 impl System for PdDisaggregationSystem {
+    fn prepare_graph(&mut self, graph: &mut Graph) -> Result<()> {
+        for instance in self
+            .prefill_instances
+            .iter_mut()
+            .chain(&mut self.decode_instances)
+        {
+            instance.prepare_graph(graph)?;
+        }
+        Ok(())
+    }
     fn completed_requests(&self) -> Option<usize> {
         Some(self.results.len())
     }
@@ -516,6 +710,33 @@ impl System for PdDisaggregationSystem {
     }
 
     fn init(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.allow_gpu_sharing || self.shared_execution,
+            "GPU sharing requires shared execution"
+        );
+        anyhow::ensure!(
+            matches!(self.kv_handoff.as_str(), "layer" | "whole"),
+            "kv_handoff must be layer or whole"
+        );
+        for instance in self.prefill_instances.iter().chain(&self.decode_instances) {
+            anyhow::ensure!(
+                instance.shared_execution() == self.shared_execution,
+                "P/D parent and all runners must use the same execution mode"
+            );
+        }
+        if self.shared_execution {
+            let topology = self
+                .kv_topology
+                .as_ref()
+                .ok_or_else(|| anyhow!("shared Rooflang requires a physical KV topology"))?;
+            anyhow::ensure!(
+                topology
+                    .links
+                    .iter()
+                    .all(|l| l.resource.as_ref().is_some_and(|s| !s.is_empty())),
+                "shared KV links require physical resource IDs"
+            );
+        }
         if self.prefill_instances.is_empty() {
             bail!("pd_disaggregation requires at least one prefill instance");
         }
@@ -535,20 +756,58 @@ impl System for PdDisaggregationSystem {
             ep: 1,
         })?;
 
-        for instance in &mut self.prefill_instances {
-            instance.init()?;
-            self.prefill_device_ids.push(self.network_sim.add_device());
-        }
-        for instance in &mut self.decode_instances {
-            instance.init()?;
-            self.decode_device_ids.push(self.network_sim.add_device());
-        }
-
-        for &src in &self.prefill_device_ids {
-            for &dst in &self.decode_device_ids {
-                self.network_sim
-                    .add_link(src, dst, self.link_bw, self.link_latency)?;
+        if let Some(topology) = &self.kv_topology {
+            if self.tp != 1 || self.link_bw.is_some() || self.link_latency.is_some() {
+                bail!("KV topology requires parent TP=1 and replaces manual KV links");
             }
+            topology.validate(
+                self.prefill_instances.len(),
+                self.decode_instances.len(),
+                self.allow_gpu_sharing,
+            )?;
+            if self.model.kv_bytes_per_token_per_device() % u64::from(topology.shards) != 0 {
+                bail!("KV bytes must divide evenly into shards");
+            }
+            for index in 0..topology.devices.len() {
+                if self.network_sim.add_device() != index as u64 {
+                    bail!("KV network device index mismatch");
+                }
+            }
+            for link in &topology.links {
+                self.network_sim.add_link(
+                    link.src as u64,
+                    link.dst as u64,
+                    link.bandwidth,
+                    link.latency,
+                )?;
+            }
+            for route in &topology.routes {
+                self.network_sim
+                    .set_route(route.src as u64, route.dst as u64, &route.links)?;
+            }
+        } else {
+            let bw = self.link_bw.ok_or_else(|| anyhow!("missing link_bw"))?;
+            let latency = self
+                .link_latency
+                .ok_or_else(|| anyhow!("missing link_latency"))?;
+            for _ in &self.prefill_instances {
+                self.prefill_device_ids.push(self.network_sim.add_device());
+            }
+            for _ in &self.decode_instances {
+                self.decode_device_ids.push(self.network_sim.add_device());
+            }
+            for &src in &self.prefill_device_ids {
+                for &dst in &self.decode_device_ids {
+                    self.network_sim.add_link(src, dst, bw, latency)?;
+                }
+            }
+        }
+        for instance in self
+            .prefill_instances
+            .iter_mut()
+            .chain(&mut self.decode_instances)
+        {
+            instance.init()?;
         }
 
         Ok(())
@@ -579,7 +838,84 @@ impl System for PdDisaggregationSystem {
         let prefill_instance = self.choose_prefill_instance()?;
         let request_id = request.request_id;
         let prefill_request = Self::build_prefill_request(&request)?;
-        let pending = PendingRequest::new(request, prefill_request.clone(), prefill_instance, sink);
+        let mut pending =
+            PendingRequest::new(request, prefill_request.clone(), prefill_instance, sink);
+        if self.shared_execution {
+            self.prepare_graph(graph)?;
+            let (input, output) = Self::single_llm_tokens(&pending.original)?;
+            anyhow::ensure!(input > 0, "shared KV requires nonempty input");
+            let decode = if output > 1 {
+                Some(self.choose_decode_instance()?)
+            } else {
+                None
+            };
+            pending.decode_instance = decode;
+            let topology = self.kv_topology.as_ref().unwrap();
+            let mut routes = Vec::new();
+            if let Some(decode) = decode {
+                for (src, dst, head_start, head_end) in topology.slices(prefill_instance, decode) {
+                    let path = topology
+                        .routes
+                        .iter()
+                        .find(|r| r.src == src && r.dst == dst)
+                        .unwrap();
+                    let mut seconds_per_byte = std::collections::BTreeMap::new();
+                    let mut latency = 0.0;
+                    for &i in &path.links {
+                        let link = &topology.links[i];
+                        seconds_per_byte
+                            .insert(link.resource.clone().unwrap(), 1.0 / link.bandwidth);
+                        latency += link.latency;
+                    }
+                    routes.push(crate::kv::Route {
+                        src: topology.devices[src].clone(),
+                        dst: topology.devices[dst].clone(),
+                        head_start,
+                        head_end,
+                        seconds_per_byte,
+                        latency,
+                    });
+                }
+            }
+            let layers = self.model.num_blocks();
+            let full = self.model.kv_bytes_per_token_per_device();
+            anyhow::ensure!(
+                full % u64::from(layers * topology.shards) == 0,
+                "nonintegral per-layer/head KV size"
+            );
+            graph.kv.plans.insert(
+                request_id,
+                crate::kv::Plan {
+                    source: topology.prefill_gpus[prefill_instance]
+                        .iter()
+                        .map(|&i| topology.devices[i].clone())
+                        .collect(),
+                    target: decode
+                        .map(|d| {
+                            topology.decode_gpus[d]
+                                .iter()
+                                .map(|&i| topology.devices[i].clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    routes,
+                    layers,
+                    heads: topology.shards,
+                    bytes_per_token_head_layer: full / u64::from(layers * topology.shards),
+                    input_tokens: input,
+                    max_decode_tokens: if output > 1 {
+                        input
+                            .checked_add(output - 1)
+                            .ok_or_else(|| anyhow!("KV token count overflow"))?
+                    } else {
+                        0
+                    },
+                    layer_handoff: self.kv_handoff == "layer",
+                    prefill_done: false,
+                    copies: Default::default(),
+                },
+            );
+        }
         self.pending_requests.insert(request_id, pending);
 
         let sink = self as *mut Self as *mut dyn LogicalHandler;

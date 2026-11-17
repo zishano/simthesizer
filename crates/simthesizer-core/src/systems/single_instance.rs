@@ -385,9 +385,10 @@ impl LogicalHandler for SingleInstanceSystem {
                 if batch_requests.is_empty() {
                     return Ok(0.0);
                 }
-                let last_node = self.model_runner.add_iteration(
+                let last_node = self.model_runner.add_scheduled_iteration(
                     self.model.as_ref(),
                     &batch_requests,
+                    &self.scheduler.batch_requests(),
                     current,
                     graph,
                 )?;
@@ -427,6 +428,13 @@ impl Module for SingleInstanceSystem {
 }
 
 impl System for SingleInstanceSystem {
+    fn shared_execution(&self) -> bool {
+        self.model_runner.shared_execution()
+    }
+    fn prepare_graph(&mut self, graph: &mut Graph) -> Result<()> {
+        self.model_runner
+            .prepare_graph(graph, self.scheduler.memory_limit())
+    }
     fn completed_requests(&self) -> Option<usize> {
         Some(self.results.len())
     }
@@ -453,6 +461,9 @@ impl System for SingleInstanceSystem {
             self.model.scheduler_kv_bytes_per_token(),
             parallel,
         )?;
+        if self.model_runner.shared_execution() {
+            self.scheduler.use_shared_memory()?;
+        }
         self.model_runner.init(self.model.as_ref())
     }
 

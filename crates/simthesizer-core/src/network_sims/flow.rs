@@ -530,6 +530,43 @@ impl NetworkSimulator for FlowNetworkSimulator {
         Ok(())
     }
 
+    fn set_route(
+        &mut self,
+        src: NetworkDeviceID,
+        dst: NetworkDeviceID,
+        links: &[usize],
+    ) -> Result<()> {
+        let mut current = src;
+        let mut seen = HashSet::from([src]);
+        let mut total_latency = 0.0;
+        for &index in links {
+            if !self
+                .outgoing_links
+                .get(&current)
+                .is_some_and(|out| out.contains(&index))
+            {
+                bail!("fixed route has a disconnected link");
+            }
+            let link = &self.links[index];
+            current = link.dst;
+            if !seen.insert(current) {
+                bail!("fixed route contains a cycle");
+            }
+            total_latency += link.latency;
+        }
+        if current != dst {
+            bail!("fixed route does not reach destination");
+        }
+        self.routes.insert(
+            (src, dst),
+            Route {
+                link_indices: links.to_vec(),
+                total_latency,
+            },
+        );
+        Ok(())
+    }
+
     fn simulate(
         &mut self,
         src: NetworkDeviceID,

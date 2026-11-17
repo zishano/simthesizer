@@ -4,6 +4,7 @@ import math
 
 from rooflang.language.graph import FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
+from rooflang_bridge.topology import build_topology, MODELS
 from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.h200 import H200Cluster
 from rooflang.programs.presets.rtx6000d import RTX6000DCluster
@@ -14,6 +15,30 @@ def build_hardware(config, tp):
         # Retained for old audit replay and diagnostic sensitivity tests only.
         hw, gpu, mem = _synthetic(config, tp)
         return hw, gpu, mem, _describe(hw, gpu, mem, "Synthetic", tp)
+    if "topology" in config:
+        if set(config) != {"gpu_model", "gpu_count", "gpu_ids", "topology"}:
+            raise ValueError("invalid allocated hardware schema")
+        hw = build_topology(config["topology"])
+        names = {d.name: d for d in hw.nodes if d.kind == "gpu"}
+        ids = config["gpu_ids"]
+        if (
+            tp not in (1, 2, 4, 8)
+            or config["gpu_count"] != tp
+            or len(ids) != tp
+            or len(set(ids)) != tp
+        ):
+            raise ValueError("allocated GPU IDs and gpu_count must match TP")
+        gpu = [names[name] for name in ids]
+        if any(hw.models[d] != config["gpu_model"] for d in gpu):
+            raise ValueError("allocated GPU model mismatch")
+        hw.find_aggregate_bandwidth(gpu)
+        mem = [hw.find_local_memory(d) for d in gpu]
+        return (
+            hw,
+            gpu,
+            mem,
+            _describe(hw, gpu, mem, MODELS[config["gpu_model"]], len(names)),
+        )
     if set(config) != {"gpu_model", "gpu_count"}:
         raise ValueError("preset hardware requires only gpu_model and gpu_count")
     count = config["gpu_count"]

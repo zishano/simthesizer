@@ -151,8 +151,121 @@ fn load_config(config_path: &Path) -> Result<Config> {
         }
     }
     if uses_rooflang(&document) {
-        anyhow::ensure!(document.get("system").and_then(|s|s.get("kind")).and_then(toml::Value::as_str) == Some("single_instance"),
-            "Rooflang whole-iteration backend requires a single_instance root with exclusive resources");
+        let system = document.get("system").context("missing system")?;
+        match system.get("kind").and_then(toml::Value::as_str) {
+            Some("single_instance") => {
+                anyhow::ensure!(
+                    system
+                        .get("model_runner")
+                        .and_then(|r| r.get("shared_execution"))
+                        .and_then(toml::Value::as_bool)
+                        != Some(true),
+                    "shared Rooflang execution requires a P/D root"
+                );
+            }
+            Some("pd_disaggregation") => {
+                let tp = system
+                    .get("tp")
+                    .and_then(toml::Value::as_integer)
+                    .context("Rooflang P/D requires parent tp")?;
+                let mut identities = std::collections::HashSet::new();
+                let topology = system.get("kv_topology");
+                let mut hardware_topology = None;
+                for pool in ["prefill_instances", "decode_instances"] {
+                    let children = system
+                        .get(pool)
+                        .and_then(toml::Value::as_array)
+                        .context("Rooflang P/D requires both instance pools")?;
+                    anyhow::ensure!(!children.is_empty(), "Rooflang P/D pool is empty");
+                    for (index, child) in children.iter().enumerate() {
+                        anyhow::ensure!(child.get("model") == system.get("model"),
+                            "Rooflang P/D parent and child model definitions must match for KV sizing");
+                        anyhow::ensure!(
+                            child.get("kind").and_then(toml::Value::as_str)
+                                == Some("single_instance"),
+                            "Rooflang P/D children must be single_instance systems"
+                        );
+                        let runner = child.get("model_runner").context("missing P/D runner")?;
+                        anyhow::ensure!(
+                            runner.get("kind").and_then(toml::Value::as_str) == Some("rooflang"),
+                            "Rooflang P/D requires Rooflang runners in both pools"
+                        );
+                        if let Some(topology) = topology {
+                            anyhow::ensure!(
+                                tp == 1
+                                    && topology.get("shards").and_then(toml::Value::as_integer)
+                                        == Some(8),
+                                "Rooflang KV topology requires parent TP=1 and eight KV heads"
+                            );
+                            let hardware = runner.get("hardware").context("missing hardware")?;
+                            let spec = hardware
+                                .get("topology")
+                                .context("missing shared hardware topology")?;
+                            if let Some(previous) = hardware_topology {
+                                anyhow::ensure!(
+                                    spec == previous,
+                                    "P/D hardware topology must be identical"
+                                );
+                            }
+                            hardware_topology = Some(spec);
+                            let key = if pool == "prefill_instances" {
+                                "prefill_gpus"
+                            } else {
+                                "decode_gpus"
+                            };
+                            let groups = topology
+                                .get(key)
+                                .and_then(toml::Value::as_array)
+                                .context("missing KV GPU groups")?;
+                            anyhow::ensure!(
+                                groups.len() == children.len(),
+                                "KV pool dimensions mismatch"
+                            );
+                            let group = groups[index].as_array().context("invalid KV GPU group")?;
+                            let devices = topology
+                                .get("devices")
+                                .and_then(toml::Value::as_array)
+                                .context("missing KV devices")?;
+                            let gpu_ids = hardware
+                                .get("gpu_ids")
+                                .and_then(toml::Value::as_array)
+                                .context("missing worker GPU IDs")?;
+                            anyhow::ensure!(
+                                runner.get("tp").and_then(toml::Value::as_integer)
+                                    == Some(group.len() as i64)
+                                    && hardware.get("gpu_count").and_then(toml::Value::as_integer)
+                                        == Some(group.len() as i64)
+                                    && gpu_ids.len() == group.len(),
+                                "KV group and worker TP/GPU count mismatch"
+                            );
+                            for (gpu, id) in group.iter().zip(gpu_ids) {
+                                let gpu = gpu.as_integer().context("invalid GPU index")?;
+                                anyhow::ensure!(
+                                    gpu >= 0 && devices.get(gpu as usize) == Some(id),
+                                    "KV device and worker allocation mismatch"
+                                );
+                            }
+                        } else {
+                            anyhow::ensure!(
+                                runner.get("tp").and_then(toml::Value::as_integer) == Some(tp),
+                                "Rooflang P/D parent and child TP must match without KV topology"
+                            );
+                        }
+                        let id = runner
+                            .get("instance_id")
+                            .and_then(toml::Value::as_str)
+                            .context("Rooflang P/D requires an instance_id for every runner")?;
+                        anyhow::ensure!(
+                            !id.is_empty() && identities.insert(id),
+                            "Rooflang P/D instance_id must be nonempty and unique"
+                        );
+                    }
+                }
+            }
+            _ => anyhow::bail!(
+                "Rooflang requires a single_instance root or independent P/D single_instance pools"
+            ),
+        }
     }
     toml::from_str(&raw).with_context(|| format!("failed to parse {}", config_path.display()))
 }

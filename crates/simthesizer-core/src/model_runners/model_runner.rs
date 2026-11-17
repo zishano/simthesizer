@@ -6,6 +6,22 @@ use crate::module::{LogicalHandler, Module};
 use crate::types::{NodeID, ParallelStrategy, RequestState};
 
 pub trait ModelRunner: Module + LogicalHandler {
+    fn shared_execution(&self) -> bool {
+        false
+    }
+    fn prepare_graph(&mut self, _graph: &mut Graph, _memory_limit: Option<u64>) -> Result<()> {
+        Ok(())
+    }
+    fn add_scheduled_iteration(
+        &mut self,
+        model: &dyn Model,
+        batch: &[RequestState],
+        _requests: &[crate::kv::BatchRequest],
+        current: NodeID,
+        graph: &mut Graph,
+    ) -> Result<NodeID> {
+        self.add_iteration(model, batch, current, graph)
+    }
     fn parallel_strategy(&self) -> ParallelStrategy;
 
     fn init(&mut self, _model: &dyn Model) -> Result<()> {

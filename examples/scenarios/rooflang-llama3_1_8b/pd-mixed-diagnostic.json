@@ -1,0 +1,14 @@
+{
+  "clusters": [
+    {"id": "p", "gpu_model": "rtx6000d"},
+    {"id": "d", "gpu_model": "h200"}
+  ],
+  "links": [
+    {
+      "src": "p/n0-eth-supernode-switch",
+      "dst": "d/n0-nvswitch",
+      "bandwidth_gbs": 10,
+      "latency_us": 3
+    }
+  ]
+}

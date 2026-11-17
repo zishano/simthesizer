@@ -1,10 +1,12 @@
 pub mod compute_sims;
 pub mod engine;
+pub mod kv;
 pub mod model_runners;
 pub mod models;
 pub mod module;
 pub mod network_sims;
 pub mod registry;
+pub mod resources;
 pub mod routers;
 pub mod schedulers;
 pub mod systems;

@@ -12,6 +12,12 @@ pub enum SystemEvent {
 }
 
 pub trait System: Module + LogicalHandler {
+    fn shared_execution(&self) -> bool {
+        false
+    }
+    fn prepare_graph(&mut self, _graph: &mut Graph) -> Result<()> {
+        Ok(())
+    }
     fn init(&mut self) -> Result<()>;
 
     /// Completed root results retained by this system, excluding forwarded child results.

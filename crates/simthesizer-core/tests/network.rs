@@ -156,3 +156,26 @@ fn network_time_must_be_finite_and_monotone() {
     net.simulate(0, 0, 0, 2.0, &mut None).unwrap();
     assert!(net.simulate(0, 0, 0, 1.0, &mut None).is_err());
 }
+
+#[test]
+fn fixed_hardware_route_overrides_widest_route_and_shares_its_links() {
+    let mut net = network(
+        3,
+        &[(0, 2, 100.0, 0.0), (0, 1, 10.0, 0.1), (1, 2, 10.0, 0.2)],
+    );
+    net.set_route(0, 2, &[1, 2]).unwrap();
+    let done = finish(&mut net, &[(0, 2, 100, 0.0), (1, 2, 100, 0.0)]).unwrap();
+    close(done[0], 20.3);
+    close(done[1], 20.2);
+}
+
+#[test]
+fn fixed_routes_reject_missing_links_disconnections_and_cycles() {
+    let mut net = network(
+        3,
+        &[(0, 1, 10.0, 0.0), (1, 0, 10.0, 0.0), (1, 2, 10.0, 0.0)],
+    );
+    for path in [vec![], vec![99], vec![2], vec![0, 1, 0, 2]] {
+        assert!(net.set_route(0, 2, &path).is_err());
+    }
+}

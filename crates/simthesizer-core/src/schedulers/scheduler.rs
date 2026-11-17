@@ -6,6 +6,15 @@ use crate::types::{
 };
 
 pub trait Scheduler: Module {
+    fn use_shared_memory(&mut self) -> Result<()> {
+        anyhow::bail!("scheduler does not support shared memory admission")
+    }
+    fn memory_limit(&self) -> Option<u64> {
+        None
+    }
+    fn batch_requests(&self) -> Vec<crate::kv::BatchRequest> {
+        Vec::new()
+    }
     fn init(
         &mut self,
         model_weight_bytes_per_device: u64,

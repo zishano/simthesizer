@@ -15,6 +15,8 @@ use crate::types::{
 };
 
 pub struct Graph {
+    pub resources: crate::resources::Resources,
+    pub kv: Box<crate::kv::KvRuntime>,
     next_node_id: NodeID,
     nodes: HashMap<NodeID, Node>,
     trace: Option<GraphTrace>,
@@ -41,6 +43,7 @@ struct Node {
 }
 
 enum NodeKind {
+    Resource(crate::resources::Work),
     Compute {
         simulator: *mut dyn ComputeSimulator,
         layer: Layer,
@@ -68,6 +71,7 @@ struct QueueEntry {
 
 #[derive(Clone, Copy)]
 enum EntryKind {
+    Resource,
     Compute,
     Network,
     Logical,
@@ -82,6 +86,8 @@ impl Default for Graph {
 impl Graph {
     pub fn new() -> Self {
         Self {
+            resources: Default::default(),
+            kv: Default::default(),
             next_node_id: 0,
             nodes: HashMap::new(),
             trace: None,
@@ -102,7 +108,11 @@ impl Graph {
         graph
     }
 
-    fn record(&mut self, mut event: Value) {
+    pub fn tracing_enabled(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    pub fn record(&mut self, mut event: Value) {
         if let Some(trace) = &mut self.trace {
             if trace.error.is_some() {
                 return;
@@ -117,6 +127,12 @@ impl Graph {
             if let Err(error) = result {
                 trace.error = Some(error);
             }
+        }
+    }
+
+    pub fn record_memory(&mut self) {
+        if self.trace.is_some() {
+            self.record(json!({"event":"memory_state","state":self.resources.snapshot()}));
         }
     }
 
@@ -148,6 +164,26 @@ impl Graph {
             },
             0.0,
         )
+    }
+
+    pub fn add_resource_node(&mut self, work: crate::resources::Work) -> NodeID {
+        self.insert_node(NodeKind::Resource(work), 0.0)
+    }
+
+    pub fn is_pending(&self, node: NodeID) -> bool {
+        self.nodes.contains_key(&node)
+    }
+
+    pub fn kv_event(&mut self, event: crate::kv::Event, current: NodeID) -> Result<()> {
+        let mut kv = std::mem::take(&mut self.kv);
+        let result = kv.apply(event, current, self);
+        self.kv = kv;
+        result
+    }
+
+    pub fn add_kv_node(&mut self, event: crate::kv::Event) -> NodeID {
+        let handler = self.kv.as_mut() as *mut dyn LogicalHandler;
+        self.add_logical_node(handler, event)
     }
 
     pub fn add_network_node(
@@ -257,6 +293,9 @@ impl Graph {
         self.next_node_id += 1;
         if self.trace.is_some() {
             let details = match &kind {
+                NodeKind::Resource(work) => {
+                    json!({"kind":"resource", "label":work.details.get("name").and_then(Value::as_str).unwrap_or("resource"), "work":work})
+                }
                 NodeKind::Compute {
                     layer,
                     batch,
@@ -317,10 +356,43 @@ impl Engine {
     ) -> Result<Vec<RequestResult>> {
         self.graph.check_trace(false)?;
         let mut queue = self.ready_queue()?;
-        if queue.peek().is_none_or(|entry| entry.time > 0.0) {
-            observe(0.0, self.system.as_ref())?;
-        }
-        while let Some(entry) = queue.pop() {
+        let mut last_observed = None;
+        loop {
+            for id in self.graph.resources.admit(self.graph.clock)? {
+                self.graph
+                    .record(json!({"event":"resource_start", "node":id}));
+                if let NodeKind::Resource(work) = &self.graph.nodes[&id].kind {
+                    if !work.reserve.is_empty() {
+                        self.graph.record_memory();
+                    }
+                }
+            }
+            let next_resource = self.graph.resources.next_time();
+            let next_queue = queue.peek().map(|entry| entry.time);
+            let time = match (next_resource, next_queue) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => break,
+            };
+            if time > self.graph.clock && last_observed != Some(self.graph.clock) {
+                observe(self.graph.clock, self.system.as_ref())?;
+                last_observed = Some(self.graph.clock);
+            }
+            self.graph.clock = time;
+            let finished = self.graph.resources.advance(time)?;
+            for (id, start) in finished {
+                if let NodeKind::Resource(work) = &self.graph.nodes[&id].kind {
+                    if !work.release.is_empty() {
+                        self.graph.record_memory();
+                    }
+                }
+                self.complete_node(id, start, time - start, &mut queue)?;
+            }
+            // Resource completions release ordinary descendants at the same timestamp.
+            if queue.peek().is_none_or(|entry| entry.time > time) {
+                continue;
+            }
+            let entry = queue.pop().unwrap();
             self.graph.clock = entry.time;
             self.graph.current = Some(entry.node_id);
             if self.graph.trace.is_some() {
@@ -330,9 +402,11 @@ impl Engine {
             self.process_entry(entry, &mut queue)?;
             self.graph.current = None;
             self.graph.check_trace(false)?;
-            if queue.peek().is_none_or(|next| next.time != entry.time) {
-                observe(entry.time, self.system.as_ref())?;
-            }
+        }
+        self.graph.resources.check_drained()?;
+        self.graph.kv.check_drained()?;
+        if last_observed != Some(self.graph.clock) {
+            observe(self.graph.clock, self.system.as_ref())?;
         }
         if !self.graph.nodes.is_empty() {
             bail!(
@@ -373,6 +447,13 @@ impl Engine {
         queue: &mut BinaryHeap<QueueEntry>,
     ) -> Result<()> {
         match self.entry_kind(entry.node_id)? {
+            EntryKind::Resource => {
+                let node = self.graph.nodes.get(&entry.node_id).unwrap();
+                let NodeKind::Resource(work) = &node.kind else {
+                    unreachable!()
+                };
+                self.graph.resources.submit(entry.node_id, work.clone())
+            }
             EntryKind::Compute => self.process_compute_node(entry, queue),
             EntryKind::Network => self.process_network_node(entry, queue),
             EntryKind::Logical => self.process_logical_node(entry, queue),
@@ -386,6 +467,7 @@ impl Engine {
             .get(&node_id)
             .ok_or_else(|| anyhow!("queued node {node_id} is missing"))?;
         match &node.kind {
+            NodeKind::Resource(_) => Ok(EntryKind::Resource),
             NodeKind::Compute { .. } => Ok(EntryKind::Compute),
             NodeKind::Network { .. } => Ok(EntryKind::Network),
             NodeKind::Logical { .. } => Ok(EntryKind::Logical),

@@ -1,4 +1,4 @@
-"""JSONL worker for the exclusive-resource Rooflang iteration runner."""
+"""JSONL worker for Rooflang iteration pricing and native operator lowering."""
 
 import argparse
 import json
@@ -9,6 +9,11 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit-dir", type=Path)
+    parser.add_argument(
+        "--reference-every-round",
+        action="store_true",
+        help="diagnostic: rerun the isolated shared-bridge reference every round",
+    )
     parser.add_argument(
         "--rebuild-graph",
         action="store_true",
@@ -66,6 +71,34 @@ def main():
                 reply = {"ready": True, "version": 1, "hardware": hardware_info}
                 if args.audit_dir:
                     (args.audit_dir / "init.json").write_text(json.dumps(req, indent=2))
+            elif req["op"] == "graph" and config:
+                from rooflang_bridge.execution import export_execution
+
+                if template is None:
+                    template = LlamaTemplate(config["tp"], config["hardware"])
+                selected = args.audit_dir and (
+                    trace_rounds is None or iteration in trace_rounds
+                )
+                reply = export_execution(
+                    template,
+                    req["batch"],
+                    reference=args.reference_every_round or bool(selected),
+                    details=bool(args.audit_dir) or req.get("details", True),
+                )
+                if args.audit_dir:
+                    (args.audit_dir / f"{iteration:05d}.json").write_text(
+                        json.dumps(
+                            {
+                                "batch": req["batch"],
+                                "isolated_reference": reply["reference"],
+                            }
+                        )
+                    )
+                    if trace_rounds is None or iteration in trace_rounds:
+                        (args.audit_dir / f"{iteration:05d}.plan.json").write_text(
+                            json.dumps({"batch": req["batch"], **reply})
+                        )
+                iteration += 1
             elif req["op"] == "iteration" and config:
                 if template is None:
                     result, reply = simulate(

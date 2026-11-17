@@ -13,6 +13,8 @@ use crate::types::{
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkedPrefillScheduler {
+    #[serde(skip)]
+    shared_memory: bool,
     block_size: u32,
     max_batch: usize,
     max_num_batched_tokens: u32,
@@ -219,6 +221,27 @@ impl ChunkedPrefillScheduler {
 }
 
 impl Scheduler for ChunkedPrefillScheduler {
+    fn use_shared_memory(&mut self) -> Result<()> {
+        if self.enable_prefix_caching {
+            bail!("shared Rooflang KV does not yet support prefix caching");
+        }
+        self.shared_memory = true;
+        Ok(())
+    }
+    fn memory_limit(&self) -> Option<u64> {
+        Some(self.usable_device_mem)
+    }
+    fn batch_requests(&self) -> Vec<crate::kv::BatchRequest> {
+        self.queue
+            .iter()
+            .take(self.current_batch.len())
+            .map(|r| crate::kv::BatchRequest {
+                request_id: r.request_id,
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+            })
+            .collect()
+    }
     fn init(
         &mut self,
         model_weight_bytes_per_device: u64,
@@ -271,7 +294,11 @@ impl Scheduler for ChunkedPrefillScheduler {
         let block_size = self.block_size;
         let kv_bytes_per_request_per_device = self.kv_bytes_per_request_per_device;
         let kv_bytes_per_token_per_device = self.kv_bytes_per_token_per_device;
-        let usable_device_mem = self.usable_device_mem;
+        let usable_device_mem = if self.shared_memory {
+            u64::MAX
+        } else {
+            self.usable_device_mem
+        };
         let enable_prefix_caching = self.enable_prefix_caching;
         let cache_block_bytes = self.cache_block_bytes();
         let prefix_cache = &mut self.prefix_cache;

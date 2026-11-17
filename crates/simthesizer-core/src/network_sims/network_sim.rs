@@ -16,6 +16,16 @@ pub trait NetworkSimulator: Module {
         latency: f64,
     ) -> Result<()>;
 
+    /// Pin a route using link insertion indices, after all links have been added.
+    fn set_route(
+        &mut self,
+        _src: NetworkDeviceID,
+        _dst: NetworkDeviceID,
+        _links: &[usize],
+    ) -> Result<()> {
+        anyhow::bail!("network simulator does not support fixed routes")
+    }
+
     fn simulate(
         &mut self,
         src: NetworkDeviceID,
