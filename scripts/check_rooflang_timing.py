@@ -14,6 +14,7 @@ from pathlib import Path
 from draw_graph import load_trace
 from rooflang.runtime.simulator import Simulator
 from rooflang_bridge.llama import build
+from rooflang_bridge.observations import iteration_nodes
 
 
 def close(a, b, context, *, tolerance=1e-8):
@@ -23,15 +24,8 @@ def close(a, b, context, *, tolerance=1e-8):
 
 def check(trace_path, audit_dir):
     outer = load_trace(trace_path)
-    iterations = sorted(
-        (
-            n
-            for n in outer["nodes"]
-            if n["details"]["label"].startswith("RooflangIteration")
-        ),
-        key=lambda n: n["dispatches"][0][0],
-    )
     config = json.loads((audit_dir / "init.json").read_text())
+    iterations = iteration_nodes(outer, config)
     paths = sorted(p for p in audit_dir.glob("[0-9]*.json") if ".trace." not in p.name)
     if len(paths) != len(iterations):
         raise ValueError("audit and outer iteration counts differ")
@@ -78,6 +72,7 @@ def check(trace_path, audit_dir):
                 raise ValueError("checker expects the exclusive stream0 backend")
             streams[e["pid"]].append(e)
             row = {
+                "instance_id": config.get("instance_id"),
                 "round": index,
                 "operator": e["name"],
                 "device": e["pid"],
@@ -157,6 +152,7 @@ def check(trace_path, audit_dir):
             }
         )
     return {
+        "instance_id": config.get("instance_id"),
         "rounds_checked": len(iterations),
         "detailed_rounds": sampled,
         "max_outer_conversion_error_s": max_outer_error,

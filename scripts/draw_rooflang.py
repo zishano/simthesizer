@@ -16,6 +16,7 @@ from draw_graph import load_trace
 from rooflang.language.kernels.comm import CommKernel
 from rooflang.runtime.simulator import Simulator
 from rooflang_bridge.llama import build
+from rooflang_bridge.observations import iteration_nodes
 
 
 def export_round(audit, config):
@@ -143,14 +144,7 @@ def export_round(audit, config):
 def assemble(trace, audit_dir):
     outer = load_trace(trace)
     config = json.loads((audit_dir / "init.json").read_text())
-    iterations = sorted(
-        (
-            n
-            for n in outer["nodes"]
-            if n["details"]["label"].startswith("RooflangIteration")
-        ),
-        key=lambda n: n["dispatches"][0][0],
-    )
+    iterations = iteration_nodes(outer, config)
     paths = sorted(p for p in audit_dir.glob("[0-9]*.json") if ".trace." not in p.name)
     if len(paths) != len(iterations):
         raise ValueError("outer iteration count and audit count differ")
@@ -171,11 +165,12 @@ def assemble(trace, audit_dir):
     return {"outer": outer, "rounds": rounds, "config": config}
 
 
-HTML = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+HTML = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>Simthesizer × Rooflang 全图</title>
 <style>
 body{font:14px system-ui;margin:24px;background:#f5f7fb;color:#192b42}h1{font-size:25px}h2{font-size:18px}button,select,input{margin:5px;padding:6px}button{cursor:pointer}section{background:white;padding:16px;margin:16px 0;border-radius:10px;border:1px solid #dbe2ec}.view{overflow:auto;height:580px;border:1px solid #dbe2ec;background:#fff}svg text{font:12px monospace}pre{white-space:pre-wrap;word-break:break-word;max-height:400px;overflow:auto}.grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(280px,1fr);gap:16px}.muted{color:#596a80}.legend span{margin-right:18px}#detail{font-size:12px}a{color:#245fa5}
 </style>
+</head><body>
 <h1>Simthesizer 动态 DAG → Rooflang 完整执行图</h1><h2 id="hardwareTitle"></h2>
 <p>真实运行的外层事件记录；内层按该轮批次重建并核对耗时。全部 32 层、残差、KV 和通信节点均保留。</p>
 <p class="muted">外层单位：秒。内层单位：微秒；全局时间 = 本轮开始秒数 + 内层时间 / 10⁶。点击外层 RooflangIteration 进入对应轮次。此连接表示封装关系，并非把内层节点插入外层引擎。</p>
@@ -207,14 +202,14 @@ $('summary').textContent=`批次 ${JSON.stringify(r.audit.batch)}；${r.audit.du
 details();hardwareRender(r);}
 function details(){const r=current(),n=r.nodes.find(n=>n.id===selected);$('neighbors').replaceChildren();if(!n){$('detail').textContent='点击节点查看完整属性';return;}$('detail').textContent=JSON.stringify({...n,global_times_s:n.timings.map(t=>({device:t.device,start:r.start_s+t.start_us/1e6,end:r.start_s+t.end_us/1e6}))},null,2);for(const [title,edges,field] of [['前驱',r.edges.filter(e=>e.target===n.id),'source'],['后继',r.edges.filter(e=>e.source===n.id),'target']]){let p=document.createElement('div');p.textContent=title+': ';for(const id of new Set(edges.filter(e=>e.kind!=='stream').map(e=>e[field]))){let b=document.createElement('button');b.textContent='#'+id;b.onclick=()=>jump(id);p.append(b);}$('neighbors').append(p);}}
 function hardwareRender(r){
-const info=r.hardware_info;$('hardwareTitle').textContent=`${info.gpu_count} × ${info.gpu_model} · TP=${data.config.tp}`;
+const info=r.hardware_info;$('hardwareTitle').textContent=`${data.config.instance_id?'实例 '+data.config.instance_id+' · ':''}${info.gpu_count} × ${info.gpu_model} · TP=${data.config.tp}`;
 const groups=new Map();for(const n of r.hardware_nodes){if(!groups.has(n.kind))groups.set(n.kind,[]);groups.get(n.kind).push(n);}const positions=new Map();let row=0,width=1000;for(const items of groups.values()){width=Math.max(width,items.length*240+40);items.forEach((n,i)=>positions.set(n.name,[130+i*240,50+row*120]));row++;}
 let s=`<svg width="${width}" height="${row*120+40}">`;for(const e of r.hardware){let [x,y]=positions.get(e.source),[a,b]=positions.get(e.target);s+=`<path d="M${x} ${y} Q${(x+a)/2+25} ${(y+b)/2-35},${a} ${b}" fill="none" stroke="#a6b7c8"><title>${esc(e.name)} · ${e.bandwidth_gbs} GB/s · ${e.latency_us} μs</title></path>`;}
-for(const n of r.hardware_nodes){let [x,y]=positions.get(n.name);s+=`<g><rect x="${x-110}" y="${y-23}" width="220" height="46" rx="6" fill="${n.allocated?'#c4e5fc':n.kind==='gpu'?'#eee':'#e4eee7'}" stroke="${n.allocated?'#1976b7':'#bcc9ce'}"/><text x="${x-103}" y="${y-3}">${esc(n.name)}</text><text x="${x-103}" y="${y+14}">${esc(n.kind)}${n.kind==='gpu'?(n.allocated?' · 本实例使用':' · 未分配'):''}</text></g>`;}
-$('hardware').style.overflow='auto';$('hardware').innerHTML=s+'</svg>';$('hwinfo').textContent=`本实例分配 ${info.gpu_count} 张卡；上游原始节点拓扑共 ${info.topology_gpu_count} 张卡。未分配 GPU 不执行本实例算子。\n`+JSON.stringify({resolved:info,selection:data.config.hardware,links:r.hardware},null,2);}
+for(const n of r.hardware_nodes){let [x,y]=positions.get(n.name);s+=`<g><rect x="${x-110}" y="${y-23}" width="220" height="46" rx="6" fill="${n.allocated?'#c4e5fc':n.kind==='gpu'?'#eee':'#e4eee7'}" stroke="${n.allocated?'#1976b7':'#bcc9ce'}"/><text x="${x-103}" y="${y-3}">${esc(n.name)}</text><text x="${x-103}" y="${y+14}">${esc(n.kind)}${n.kind==='gpu'?(n.allocated?' · 本实例使用':' · 非本实例'):''}</text></g>`;}
+$('hardware').style.overflow='auto';$('hardware').innerHTML=s+'</svg>';$('hwinfo').textContent=`本实例分配 ${info.gpu_count} 张卡；共享硬件拓扑共 ${info.topology_gpu_count} 张卡。其他 GPU 不执行本实例算子，可能分配给其他 P/D 实例。\n`+JSON.stringify({resolved:info,selection:data.config.hardware,links:r.hardware},null,2);}
 
 $('prev').onclick=()=>{step.value=Math.max(0,+step.value-1);outerRender();};$('next').onclick=()=>{step.value=Math.min(+step.max,+step.value+1);outerRender();};$('last').onclick=()=>{step.value=step.max;outerRender();};step.oninput=outerRender;$('play').onclick=()=>{if(timer){clearInterval(timer);timer=null;$('play').textContent='播放';return;}if(step.value===step.max)step.value=0;$('play').textContent='暂停';timer=setInterval(()=>{if(+step.value>=+step.max){$('play').click();return;}$('next').click();},200);};$('round').onchange=()=>{selected=null;innerRender();};$('layer').onchange=innerRender;$('streams').onchange=innerRender;$('zoom').oninput=innerRender;outerRender();innerRender();
-</script></html>"""
+</script></body></html>"""
 
 
 def main():
