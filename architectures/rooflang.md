@@ -1,4 +1,9 @@
-# Rooflang whole-iteration prototype
+# Rooflang integration
+
+Two execution modes share the validated Llama graph and hardware presets.
+`exclusive` retains the whole-iteration bridge described below. `shared`
+lowers operators into native events with cross-instance resources and persistent
+KV; see [shared execution](rooflang-shared.md). Agent search is separate.
 
 ## Source and model entry points
 
@@ -29,10 +34,10 @@ Python and Rust definitions are tested for identical plans, metadata, per-round
 costs and token timings at TP 1/2/4/8. The Python module also defines the Rooflang
 graph; the Rust path is lowered to that matching graph after validation.
 
-## Contract and mapping
+## Exclusive-mode contract and mapping
 
-Requested scope: FP16 Llama 3.1 8B, one serving instance with exclusive devices
-and fabrics. Scheduler admission, token commits, preemption and KV ownership
+Supported scope: FP16 Llama 3.1 8B, each serving instance with exclusive devices
+for computation. Scheduler admission, token commits, preemption and KV ownership
 remain in Simthesizer. `RooflangRunner` sends the exact per-request query, cached
 KV and logits lengths to a persistent Python worker. The worker validates the
 32-layer plan, builds and validates one complete Rooflang graph template,
@@ -40,9 +45,83 @@ binds each batch to it, runs a fresh DES, and returns microseconds. The runner c
 iteration node before the existing batch-completion callback. Wall-clock IPC
 and Python runtime do not enter simulated time.
 
-The CLI rejects nested multi-instance/P-D configurations using this runner.
-Library callers must also honor the exclusive-resource contract. No shared
-persistent Rooflang runtime or cross-iteration overlap is claimed.
+The CLI permits a single-instance root or a P/D root containing independent
+single-instance Rooflang leaves. Other nested/multi-instance topologies remain
+rejected. Topology-backed P/D leaves reference disjoint device IDs in a shared
+hardware specification. Workers reconstruct that specification independently;
+there is no shared persistent Rooflang runtime. Leaves may overlap in engine
+time, while rounds on one leaf remain serialized. Legacy manual-link scenarios
+retain independent virtual allocations even when preset names coincide.
+
+## Native P/D composition (exclusive mode)
+
+P/D uses the existing `PdDisaggregationSystem`: round-robin P and D pools,
+per-leaf schedulers/KV accounting, a native network node gating decode release,
+and merged token latencies. It supports single-LLM requests only. Each leaf has
+a unique nonempty runner `instance_id`, its own Python worker and audit directory.
+The identity is included in outer iteration labels and the worker init record;
+analysis selects that instance before joining round summaries or checking time.
+Old single-instance audits without an identity remain readable.
+
+Parent and children use matching model definitions. In topology mode, the parent
+initializes the model at TP=1 to obtain full KV bytes; each leaf independently
+uses TP=1/2/4/8. Contiguous KV-head intervals determine rank-to-rank slices.
+One native network node carries each nonempty interval intersection, and a
+barrier releases D only after every slice arrives. Total bytes equal input
+tokens × full-model KV bytes per token, regardless of P/D TP. The newly sampled
+token has no KV until D processes it. First decode ITL includes transfer and
+D queueing. P private KV is still released at child completion; sender staging
+residency and receiver reservations are not modeled.
+
+The inspection composer owns deployment normalization: per-side model, instance
+count, TP, batch/token limits, and ordered GPU IDs. Pool GPU count must equal
+instances × TP. PP/EP values other than 1 fail explicitly. Device capacity comes
+from the allocated GPU's local memory. One TP group must stay within one preset
+cluster. Default same-model deployment uses a shared upstream preset: RTX
+Ethernet scope rounded up to eight GPUs, or H200/B300 node count rounded up to
+eight GPUs per node. Custom `--hardware-topology JSON` specifies `clusters`
+(id, gpu_model, optional n_nodes/RTX eth_scope) and `links` (src/dst component
+names, bandwidth_gbs, latency_us). Bridges are symmetric full-duplex fabrics.
+Mixed models require explicit connectivity; missing paths fail before execution.
+Optional `--prefill-gpu-ids` and `--decode-gpu-ids` override automatic allocation.
+
+The composer exports directed physical links and fixed Rooflang routes to the
+native flow simulator. Link indices retain shared resource identity across
+ranks and instances; pinning routes avoids the native widest-path policy choosing
+a different path. KV traffic shares these links. Paths containing half-duplex
+fabrics are currently rejected. Worker-internal TP/HBM operations do not contend
+with this native KV network. No separate source/destination memory-copy cost is
+added. Preset costs and diagnostic bridges are not measured performance claims.
+
+```sh
+./run_rooflang_pd.sh
+# Or: one TP4 prefill instance and two TP2 decode instances, eight GPUs total.
+uv run --locked python scripts/inspect_rooflang.py --pd \
+  --prefill-gpu-model rtx6000d --prefill-gpu-count 4 --prefill-tp 4 \
+  --decode-gpu-model rtx6000d --decode-gpu-count 4 --decode-tp 2 \
+  --decode-instances 2
+```
+
+`--prefill-max-batch`, `--decode-max-batch`, `--prefill-token-budget` and
+`--decode-token-budget` independently control schedulers. Global `--tp`,
+`--gpu-model` and `--token-budget` remain defaults when side-specific options
+are omitted. `pd-mixed-diagnostic.json` demonstrates an explicitly synthetic
+10 GB/s, 3 us bridge between RTX and H200 clusters; it is a schema example,
+not a measured or standard physical interconnect.
+
+With `--reports`, inspection retains the global outer trace and per-instance audits, costs,
+timing reports and graphs under `instances/p0/`, `instances/d0/`, etc.
+`kv-transfers.csv` contains request ID, rank endpoints, head interval [start,end),
+bytes, path/link IDs and engine start/finish times. `kv-handoffs.csv` contains
+total bytes and KV waiting time until decode release (excludes D queue/compute).
+The report shows all allocations, including idle leaves. `hardware-topology.json`
+and `kv-topology.json` retain the source specification and lowered network.
+`--trace-rounds` applies to each leaf's local zero-based rounds. Idle leaves get
+zero-round reports without graphs or cost CSVs.
+
+Explicit `--kv-link-bw` and `--kv-link-latency` retain legacy single-shard
+manual-link diagnostics; they cannot be combined with independent P/D settings.
+Legacy scenarios require matching TP and preserve their original cost semantics.
 
 R1: Llama shape identity -> worker init validates all pre/block/post layers;
 unsupported models fail. R2: ragged batch -> sum queries for GEMMs, sum causal
@@ -173,7 +252,7 @@ uv run --locked python -m unittest discover -s tests -v
 
 Rooflang tests run in the normal project environment without optional skips: ragged causal work, TP collectives
 and link sensitivity, hardware units and OOM, chunked-prefill/token timing,
-mixed batches/model rejection, and single-instance enforcement. Tests use the
+mixed batches/model rejection, independent P/D handoff and topology validation. Tests use the
 compiled debug CLI; set `SIMTHESIZER_BIN` for the integration cases when needed.
 
 ## Whole-run graph explorer
@@ -209,8 +288,8 @@ uv run --locked python scripts/check_rooflang_timing.py \
   --trace output/outer.jsonl --audit-dir output/audit --output-dir output/check
 ```
 
-The checker verifies all outer duration conversions and exclusive iteration
-order, then checks sampled operator costs against fresh graph execution,
+The checker verifies the selected instance's outer duration conversions and
+exclusive iteration order, then checks sampled operator costs against fresh graph execution,
 stream serialization and graph dependencies. Its max(compute,memory,network)
 check assumes this backend's exclusive devices and stream0; it is not a generic
 contention checker. The CSV reports base compute, local-memory and network costs
@@ -228,11 +307,15 @@ These are modeling boundaries, not evidence of calibrated GPU accuracy.
 ## One-command inspection
 
 Run `uv run --locked python scripts/inspect_rooflang.py` from the repository.
-The default small workload exports metrics, both graph views, timing checks and
-an `index.html` linking the artifacts in a new directory under `output/`.
+The default saves request results, metrics, `metrics.png`, configuration, workload
+and small runtime/plot logs in a new directory under `output/`; no history is collected.
+The metric plot reads request results only and does not require `--reports`.
 Use `--gpu-model h200 --tp 4 --model-entry python` to select hardware and entry.
-Use `--workload examples/workloads/realistic.jsonl` for a full workload: detailed
-traces are sampled and HTML graph generation is disabled unless `--full-graphs`
-is given. `--trace-rounds` selects detailed rounds; all summaries remain saved.
+Use `--workload examples/workloads/realistic.jsonl` for a full workload.
+`--reports` enables native history, per-round audits, CSVs, timing checks and
+the report index. `--full-graphs` also enables complete HTML graphs.
+`--trace-rounds` selects detailed audited rounds when reports are enabled;
+all round summaries remain saved in that mode. Shared execution caches plans;
+`--reference-every-round` enables the slower diagnostic reference path.
 `--reference PATH` adds a comparison with matching measured results.
 `--output-dir PATH` requires a new directory to prevent mixing runs.

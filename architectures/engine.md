@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The engine owns virtual time and execution order. It knows three node kinds
+The engine owns virtual time and execution order. It knows four node kinds
 and nothing about requests, batches, or models.
 
 ## Graph
@@ -18,6 +18,10 @@ release time and its last predecessor's finish.
   Its network simulator is polled until the transfer completes.
 - A **logical node** holds an opaque payload for one owning handler. The
   handler returns a latency and may mutate the graph.
+- A **resource node** holds concurrent service demands, exclusive stream slots,
+  and memory reservations/releases. Physical resource IDs are shared across
+  such nodes. The resource domain owns rates and capacity; the engine advances
+  it at every ready event or service-component boundary.
 
 Payloads are private to their owner. The engine never inspects them, so new
 behavior needs no engine change.
@@ -60,8 +64,14 @@ Nodes reference their handler or simulator by raw pointer. This is sound
 because:
 
 - every handler and simulator lives in the boxed config tree, which is neither
-  moved nor restructured after initialization;
+  moved nor restructured after initialization, or is the graph-owned boxed KV
+  lifecycle handler, whose allocation is stable for the run;
 - execution is single-threaded, so handler and simulator calls never overlap.
+
+The graph retains the shared resource domain and KV handler for the whole run.
+KV semantics remain in that handler. Resource nodes complete at their actual
+finish time, unlike fixed-cost logical/compute nodes whose future finish can
+be resolved at dispatch. Rate changes leave no stale completion predictions.
 
 ## Evolution Rules
 

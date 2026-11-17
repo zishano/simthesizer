@@ -1,0 +1,5 @@
+# Match uv.lock's registry instead of the inherited legacy UV_INDEX_URL mirror.
+[[index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

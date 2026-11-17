@@ -4,8 +4,9 @@
 
 A `Scheduler` owns the ready LLM sub-requests of one memory domain: which run
 in the next iteration, how many tokens each processes, and what KV each holds.
-It is the only component that tracks token progress; runners see only the
-batch shape. A `Router` owns whole-request placement across instances.
+It is the only component that commits token progress. Runners receive batch
+shapes and, for shared execution, matching request identities. A `Router` owns
+whole-request placement across instances.
 
 ## Contract
 
@@ -42,6 +43,13 @@ batch shape. A `Router` owns whole-request placement across instances.
 - `max_batch` and `max_num_batched_tokens` are per rank and scale with `ep`.
 
 ## Prefix Cache
+
+The cache and block-memory rules here describe legacy scheduling. Shared
+Rooflang keeps FCFS batching/token budgets but delegates physical memory
+admission to the execution domain, disables preemption, and rejects enabled
+prefix caching. Its persistent KV is dense token/head/layer intervals; see
+[shared execution](rooflang-shared.md). A scheduled batch may wait for its
+atomic capacity reservation; scheduler admission does not imply GPU execution.
 
 - One cache per scheduler, never shared across instances, ranks, or
   disaggregated pools.

@@ -61,8 +61,9 @@ own all serving semantics and reach the engine only through graph nodes.
 - A `System` owns request lifecycle: seeding request DAGs, splicing in work,
   completion accounting, and composition into multi-instance and disaggregated
   topologies; see [serving systems](architectures/systems.md).
-- A `Scheduler` owns ready LLM work, batch admission, KV memory, and its
-  prefix cache. A `Router` owns whole-request placement; see
+- A `Scheduler` owns ready LLM work and token progress. Legacy schedulers own
+  KV capacity and prefix caches; shared Rooflang delegates physical capacity
+  and persistent KV to the run's execution domain. A `Router` owns placement; see
   [scheduling](architectures/scheduling.md).
 - A `Model` owns the layer plan and memory footprint for a parallel strategy.
   A `ModelRunner` owns one parallelism axis and expands a batch into compute
@@ -71,8 +72,8 @@ own all serving semantics and reach the engine only through graph nodes.
 - A `ComputeSimulator` prices one layer for one batch. A `NetworkSimulator`
   prices point-to-point transfers over a topology; see
   [cost models](architectures/cost-models.md).
-- An exclusive-resource Rooflang runner uses bundled source to price whole Llama
-  iterations from Rust or Python model definitions, without profiling tables;
+- Rooflang runners use bundled source to price whole Llama iterations or lower
+  operator demands into native shared-resource events, without profiling tables;
   see [Rooflang integration](architectures/rooflang.md).
 - `scripts/profile.py` measures vLLM components and preserves exact batch shapes
   in JSONL; see [profiling](architectures/profiling.md).
@@ -107,7 +108,8 @@ Detailed contracts:
 3. The engine runs ready nodes in (time, node ID) order until the graph drains.
 4. A logical node calls back into its owner, which may add nodes or rewire the
    running node's outgoing edges. Compute and network nodes ask their simulator
-   for a latency.
+   for a latency. Resource nodes run through a common capacity and rate domain;
+   their component completions participate in the same engine clock.
 5. Systems hand over finished requests; the CLI writes them by request ID.
 
 Every workload request is seeded before the engine starts. Routing runs at
