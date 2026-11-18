@@ -12,6 +12,17 @@ pub enum SystemEvent {
 }
 
 pub trait System: Module + LogicalHandler {
+    fn policy_statistics(&self) -> Option<crate::policies::PolicyStatistics> {
+        None
+    }
+    fn configure_policy(
+        &mut self,
+        _policy: crate::policies::SharedPolicy,
+        _instance: crate::policies::InstanceId,
+    ) -> Result<()> {
+        anyhow::bail!("system does not support serving policies")
+    }
+
     fn shared_execution(&self) -> bool {
         false
     }

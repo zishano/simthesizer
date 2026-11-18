@@ -1,4 +1,5 @@
 //! Persistent KV ownership and causal P/D copies on the shared resource domain.
+use crate::policies::{KvObservation, PendingKv, SharedPolicy};
 use crate::resources::{Allocation, Demand, Work};
 use crate::types::NodeID;
 use crate::{Graph, LogicalHandler, Module};
@@ -56,6 +57,7 @@ struct Block {
     state: &'static str,
     refs: usize,
     bytes: u64,
+    produced_at: f64,
 }
 
 #[derive(Debug)]
@@ -82,6 +84,7 @@ pub enum Event {
     },
     PrefillDone(u64),
     DecodeDone(u64),
+    PolicyWake,
 }
 
 /// Disjoint, merged ready intervals. A later arrival must never bridge a gap.
@@ -119,6 +122,13 @@ struct RequestKv {
     appends: BTreeMap<(u32, usize), Block>,
     // Per head because a target TP rank may receive shards from several sources.
     ready: BTreeMap<(bool, u32, usize), Vec<Intervals>>,
+    gates: BTreeMap<(u32, usize), BTreeMap<u32, NodeID>>,
+}
+
+struct PendingTransfer {
+    observation: PendingKv,
+    source: u64,
+    route: Route,
 }
 
 #[derive(Default)]
@@ -127,9 +137,131 @@ pub struct KvRuntime {
     requests: BTreeMap<u64, RequestKv>,
     next: u64,
     pub hbm_seconds_per_byte: BTreeMap<String, f64>,
+    policy: Option<SharedPolicy>,
+    pending: BTreeMap<u64, PendingTransfer>,
+    inflight: usize,
+    wake: Option<NodeID>,
 }
 
 impl KvRuntime {
+    pub fn configure_policy(&mut self, policy: SharedPolicy) -> Result<()> {
+        // The reference keeps the existing eager transfer path.
+        if !policy.borrow().is_reference() {
+            self.policy = Some(policy);
+        }
+        Ok(())
+    }
+
+    pub fn controlled(&self) -> bool {
+        self.policy.is_some()
+    }
+
+    pub fn ready_tokens(&self, request: u64, prefill: bool, layer: u32, rank: usize) -> u32 {
+        self.requests
+            .get(&request)
+            .and_then(|s| s.ready.get(&(prefill, layer, rank)))
+            .map(|heads| heads.iter().map(Intervals::prefix).min().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    pub fn read_gate(&self, request: u64, layer: u32, rank: usize, tokens: u32) -> Option<NodeID> {
+        self.requests
+            .get(&request)?
+            .gates
+            .get(&(layer, rank))?
+            .get(&tokens)
+            .copied()
+    }
+
+    pub fn register_read_gate(
+        &mut self,
+        request: u64,
+        layer: u32,
+        rank: usize,
+        tokens: u32,
+        node: NodeID,
+    ) {
+        self.requests
+            .entry(request)
+            .or_default()
+            .gates
+            .entry((layer, rank))
+            .or_default()
+            .insert(tokens, node);
+    }
+
+    fn release_read_gates(
+        &mut self,
+        request: u64,
+        layer: u32,
+        rank: usize,
+        current: NodeID,
+        graph: &mut Graph,
+    ) -> Result<()> {
+        let end = self.ready_tokens(request, false, layer, rank);
+        let state = self
+            .requests
+            .get_mut(&request)
+            .context("missing KV request")?;
+        if let Some(gates) = state.gates.get_mut(&(layer, rank)) {
+            while gates
+                .first_key_value()
+                .is_some_and(|(&tokens, _)| tokens <= end)
+            {
+                let (_, node) = gates.pop_first().unwrap();
+                graph.release_condition(node, current)?;
+            }
+            if gates.is_empty() {
+                state.gates.remove(&(layer, rank));
+            }
+        }
+        Ok(())
+    }
+
+    fn drive_policy(&mut self, current: NodeID, graph: &mut Graph) -> Result<()> {
+        let Some(policy) = self.policy.clone() else {
+            return Ok(());
+        };
+        if self.pending.is_empty()
+            || self.wake.is_some()
+            || self.inflight >= policy.borrow().limits().kv_inflight_bounds[1]
+        {
+            return Ok(());
+        }
+        let pending: Vec<_> = self.pending.values().map(|p| p.observation).collect();
+        let action = policy.borrow_mut().kv(&KvObservation {
+            now: graph.now(),
+            pending: &pending,
+            inflight: self.inflight,
+        })?;
+        for id in action.submissions {
+            let transfer = self
+                .pending
+                .remove(&id)
+                .context("missing pending KV submission")?;
+            self.send_transfer(
+                transfer.observation.request_id,
+                transfer.source,
+                id,
+                transfer.route,
+                current,
+                graph,
+            )?;
+        }
+        if !self.pending.is_empty() {
+            if let Some(until) = action.wait_until {
+                let wake = graph.add_logical_node_at(
+                    self as *mut dyn LogicalHandler,
+                    Event::PolicyWake,
+                    until,
+                );
+                graph.add_edge(current, wake)?;
+                self.wake = Some(wake);
+            }
+        }
+        Ok(())
+    }
+
     pub fn reservations(&self, request: u64, prefill: bool) -> Result<Vec<Allocation>> {
         let p = self
             .plans
@@ -218,7 +350,11 @@ impl KvRuntime {
                 device: route.dst.clone(),
                 head_start: route.head_start,
                 head_end: route.head_end,
-                state: "in_flight",
+                state: if self.controlled() {
+                    "pending_send"
+                } else {
+                    "in_flight"
+                },
                 refs: 1,
                 bytes,
                 ..block.clone()
@@ -230,39 +366,92 @@ impl KvRuntime {
                 .get_mut(&source)
                 .unwrap()
                 .refs += 1;
-            self.emit(graph, "send", &received);
+            if self.controlled() {
+                self.emit(graph, "pending_send", &received);
+            }
             self.requests
                 .get_mut(&request)
                 .unwrap()
                 .received
                 .insert(target, received);
-            let mut resources: BTreeMap<_, _> = route
-                .seconds_per_byte
-                .iter()
-                .map(|(k, v)| (k.clone(), v * bytes as f64))
-                .collect();
-            for device in [&route.src, &route.dst] {
-                *resources.entry(format!("hbm:{device}")).or_default() +=
-                    self.hbm_seconds_per_byte[device] * bytes as f64;
+            if self.controlled() {
+                let p = &self.plans[&request];
+                let source_rank = p.source.iter().position(|d| *d == route.src).unwrap() as u32;
+                let target_rank = p.target.iter().position(|d| *d == route.dst).unwrap() as u32;
+                self.pending.insert(
+                    target,
+                    PendingTransfer {
+                        observation: PendingKv {
+                            id: target,
+                            request_id: request,
+                            layer: block.layer,
+                            source_rank,
+                            target_rank,
+                            token_start: block.token_start,
+                            token_end: block.token_end,
+                            bytes,
+                            produced_at: block.produced_at,
+                        },
+                        source,
+                        route,
+                    },
+                );
+            } else {
+                self.send_transfer(request, source, target, route, current, graph)?;
             }
-            let transfer = graph.add_resource_node(Work {
+        }
+        Ok(())
+    }
+
+    fn send_transfer(
+        &mut self,
+        request: u64,
+        source: u64,
+        target: u64,
+        route: Route,
+        current: NodeID,
+        graph: &mut Graph,
+    ) -> Result<()> {
+        let received = self
+            .requests
+            .get_mut(&request)
+            .unwrap()
+            .received
+            .get_mut(&target)
+            .unwrap();
+        received.state = "in_flight";
+        let block = received.clone();
+        let bytes = block.bytes;
+        self.emit(graph, "send", &block);
+        let mut resources: BTreeMap<_, _> = route
+            .seconds_per_byte
+            .iter()
+            .map(|(k, v)| (k.clone(), v * bytes as f64))
+            .collect();
+        for device in [&route.src, &route.dst] {
+            *resources.entry(format!("hbm:{device}")).or_default() +=
+                self.hbm_seconds_per_byte[device] * bytes as f64;
+        }
+        let transfer = graph.add_resource_node(Work {
                 demands: vec![Demand { resources, latency: route.latency }],
                 details: json!({"name":"kv_transfer", "request_id":block.request,"layer":block.layer,"token_start":block.token_start,"token_end":block.token_end,"head_start":route.head_start,"head_end":route.head_end,"src":route.src,"dst":route.dst,"bytes":bytes}),
                 ..Default::default()
             });
-            let ack = graph.add_logical_node(
-                self as *mut dyn LogicalHandler,
-                Event::Ack {
-                    request,
-                    source,
-                    target,
-                },
-            );
-            graph.add_edge(current, transfer)?;
-            graph.add_edge(transfer, ack)?;
-            let p = self.plans.get_mut(&request).unwrap();
-            let rank = p.target.iter().position(|d| *d == route.dst).unwrap();
-            p.copies.entry((block.layer, rank)).or_default().insert(ack);
+        let ack = graph.add_logical_node(
+            self as *mut dyn LogicalHandler,
+            Event::Ack {
+                request,
+                source,
+                target,
+            },
+        );
+        graph.add_edge(current, transfer)?;
+        graph.add_edge(transfer, ack)?;
+        let p = self.plans.get_mut(&request).unwrap();
+        let rank = p.target.iter().position(|d| *d == route.dst).unwrap();
+        p.copies.entry((block.layer, rank)).or_default().insert(ack);
+        if self.controlled() {
+            self.inflight += 1;
         }
         Ok(())
     }
@@ -293,12 +482,7 @@ impl KvRuntime {
                 rank,
                 tokens,
             } => {
-                let end = self
-                    .requests
-                    .get(&request)
-                    .and_then(|s| s.ready.get(&(prefill, layer, rank)))
-                    .map(|heads| heads.iter().map(Intervals::prefix).min().unwrap_or(0))
-                    .unwrap_or(0);
+                let end = self.ready_tokens(request, prefill, layer, rank);
                 ensure!(end >= tokens, "KV not ready: request {request} layer {layer} rank {rank}, need {tokens}, have {end}");
             }
             Event::Produce {
@@ -335,6 +519,7 @@ impl KvRuntime {
                     state: "ready",
                     refs: 1,
                     bytes: u64::from(end - start) * u64::from(width) * p.bytes_per_token_head_layer,
+                    produced_at: graph.now(),
                 };
                 let copy = prefill && p.layer_handoff && !p.target.is_empty();
                 self.next += 1;
@@ -365,6 +550,7 @@ impl KvRuntime {
                 }
                 if copy {
                     self.copy(request, id, current, graph)?;
+                    self.drive_policy(current, graph)?;
                 }
             }
             Event::Ack {
@@ -406,6 +592,14 @@ impl KvRuntime {
                     p.copies.remove(&key);
                 }
                 self.release_source(request, source, graph)?;
+                if self.controlled() {
+                    self.inflight = self
+                        .inflight
+                        .checked_sub(1)
+                        .context("KV inflight underflow")?;
+                    self.release_read_gates(request, received.layer, rank, current, graph)?;
+                    self.drive_policy(current, graph)?;
+                }
             }
             Event::PrefillDone(request) => {
                 graph.record(json!({"event":"kv_prefill_done","request_id":request}));
@@ -437,6 +631,7 @@ impl KvRuntime {
                     self.plans.remove(&request);
                     self.requests.remove(&request);
                 }
+                self.drive_policy(current, graph)?;
             }
             Event::DecodeDone(request) => {
                 let state = self
@@ -444,7 +639,9 @@ impl KvRuntime {
                     .remove(&request)
                     .context("missing decode KV")?;
                 ensure!(
-                    state.sources.is_empty() && self.plans[&request].copies.is_empty(),
+                    state.sources.is_empty()
+                        && state.gates.is_empty()
+                        && self.plans[&request].copies.is_empty(),
                     "request finished with pending KV transfer"
                 );
                 for b in state.received.values().chain(state.appends.values()) {
@@ -459,13 +656,22 @@ impl KvRuntime {
                 graph.record(json!({"event":"kv_reservation_release","allocation":format!("kv:{request}:d")}));
                 self.plans.remove(&request);
             }
+            Event::PolicyWake => {
+                ensure!(self.wake == Some(current), "unexpected KV policy wakeup");
+                self.wake = None;
+                self.drive_policy(current, graph)?;
+            }
         }
         Ok(())
     }
 
     pub fn check_drained(&self) -> Result<()> {
         ensure!(
-            self.requests.is_empty() && self.plans.is_empty(),
+            self.requests.is_empty()
+                && self.plans.is_empty()
+                && self.pending.is_empty()
+                && self.inflight == 0
+                && self.wake.is_none(),
             "KV state did not drain"
         );
         Ok(())
@@ -530,6 +736,106 @@ mod tests {
     }
 
     #[test]
+    fn deferred_copy_pins_sources_until_all_heads_arrive_and_wakes_only_ready_reads() {
+        use crate::policies::{PolicyConfig, PolicyKind, PolicyLimits, PolicyRuntime, PolicySlo};
+        let policy = std::rc::Rc::new(std::cell::RefCell::new(
+            PolicyRuntime::new(PolicyConfig {
+                kind: PolicyKind::Candidate,
+                seed: 0,
+                limits: PolicyLimits {
+                    p_token_budget_bounds: [1, 128],
+                    d_token_budget_bounds: [1, 32],
+                    p_batch_bounds: [1, 32],
+                    d_batch_bounds: [1, 32],
+                    kv_inflight_bounds: [1, 1],
+                    max_wait_s: 0.05,
+                    state_limit_bytes: 64,
+                },
+                slo: PolicySlo {
+                    ttft_limit_s: 5.0,
+                    tpot_limit_s: 0.05,
+                },
+            })
+            .unwrap(),
+        ));
+        let mut kv = Box::new(runtime());
+        kv.configure_policy(policy).unwrap();
+        let p = kv.plans.get_mut(&7).unwrap();
+        p.layer_handoff = false;
+        p.routes = (0..2)
+            .map(|rank| Route {
+                src: format!("p{rank}"),
+                dst: "d0".into(),
+                head_start: rank * 2,
+                head_end: rank * 2 + 2,
+                seconds_per_byte: [("link".into(), 0.01)].into(),
+                latency: 0.0,
+            })
+            .collect();
+        kv.hbm_seconds_per_byte = [
+            ("p0".into(), 0.01),
+            ("p1".into(), 0.01),
+            ("d0".into(), 0.01),
+        ]
+        .into();
+        let mut graph = Graph::new();
+        let current =
+            graph.add_logical_node(&mut *kv as *mut dyn LogicalHandler, Event::PrefillDone(7));
+        for rank in 0..2 {
+            kv.apply(
+                Event::Produce {
+                    request: 7,
+                    prefill: true,
+                    layer: 0,
+                    rank,
+                    start: 0,
+                    end: 20,
+                },
+                current,
+                &mut graph,
+            )
+            .unwrap();
+        }
+        let gate = graph.add_condition();
+        kv.register_read_gate(7, 0, 0, 20, gate);
+        kv.apply(Event::PrefillDone(7), current, &mut graph)
+            .unwrap();
+        assert_eq!(kv.pending.len(), 1);
+        assert_eq!(kv.inflight, 1);
+        assert!(kv.requests[&7].sources.values().all(|b| b.refs == 1));
+        assert_eq!(kv.ready_tokens(7, false, 0, 0), 0);
+        for index in 0..2 {
+            let b = kv.requests[&7]
+                .received
+                .values()
+                .find(|b| b.state == "in_flight")
+                .unwrap()
+                .clone();
+            let ack = *kv.plans[&7].copies[&(0, 0)].first().unwrap();
+            kv.apply(
+                Event::Ack {
+                    request: 7,
+                    source: b.source.unwrap(),
+                    target: b.id,
+                },
+                ack,
+                &mut graph,
+            )
+            .unwrap();
+            if index == 0 {
+                assert_eq!(kv.ready_tokens(7, false, 0, 0), 0);
+                assert_eq!(kv.read_gate(7, 0, 0, 20), Some(gate));
+                assert_eq!(kv.requests[&7].sources.len(), 1);
+            }
+        }
+        assert_eq!(kv.ready_tokens(7, false, 0, 0), 20);
+        assert_eq!(kv.read_gate(7, 0, 0, 20), None);
+        assert!(kv.pending.is_empty());
+        assert!(kv.requests[&7].sources.is_empty());
+        assert_eq!(kv.inflight, 0);
+    }
+
+    #[test]
     fn ready_index_checks_all_heads_and_scopes() {
         let mut kv = runtime();
         let mut graph = Graph::new();
@@ -547,6 +853,7 @@ mod tests {
             state: "ready",
             refs: 1,
             bytes: 640,
+            produced_at: 0.0,
         };
         kv.mark_ready(&block);
         let read = |kv: &mut KvRuntime, graph: &mut Graph, request, layer, tokens| {

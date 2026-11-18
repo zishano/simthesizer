@@ -1,7 +1,7 @@
 // Run with Node; optional HTML arguments check indexed replay against native data.
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
-const {FlowIntervalIndex,ModuleFlowModel}=require('../scripts/rooflang_bridge/module_flow.js');
+const {FlowIntervalIndex,ModuleFlowModel,describeFlowEvent}=require('../scripts/rooflang_bridge/module_flow.js');
 
 const intervals=[{id:1,start:1,finish:4},{id:2,start:2,finish:3},{id:3,start:2,finish:2},{id:4,start:4,finish:6}];
 const index=new FlowIntervalIndex(intervals);
@@ -34,6 +34,26 @@ assert.equal(model.at(7).kv.d,0);
 assert.equal(model.at(2).kv.d,0);
 assert.equal(model.at(6).kv.d,28);
 assert.equal(model.at(1).queues.p,null);
+
+// A completed batch triggers another schedule, even when no round is produced.
+// Arrival and enqueue have the same timestamp but dispatch order, not ID order.
+const scheduleNodes=[
+  {id:20,time:0,start:1,finish:1,dispatches:[[2,1]],cause:null,view:{flow:'p_schedule',flow_event:'SubRequestArrival',round:null}},
+  {id:10,time:1,start:1,finish:1,dispatches:[[3,1]],cause:20,view:{flow:'p_schedule',flow_event:'LlmEnqueue',round:null}},
+  {id:30,time:1,start:1,finish:1,dispatches:[[4,1]],cause:10,view:{flow:'p_schedule',flow_event:'LlmSchedule',round:0}},
+  {id:50,time:2,start:2,finish:2,dispatches:[[8,2]],cause:40,view:{flow:'p_schedule',flow_event:'LlmSchedule',round:null}}
+];
+const scheduleIndex=new FlowIntervalIndex(scheduleNodes),byId=new Map(scheduleNodes.map(n=>[n.id,n]));
+byId.set(40,{id:40,view:{flow_event:'LlmBatchComplete'}});
+assert.deepEqual(scheduleIndex.starts.map(n=>n.id),[20,10,30,50]);
+assert.equal(scheduleIndex.at(1).done,3);
+assert.equal(scheduleIndex.at(1).total,4);
+assert.match(describeFlowEvent(byId.get(30),byId).meaning,/入队后.*生成轮次 0/);
+assert.match(describeFlowEvent(byId.get(50),byId).meaning,/上一批次完成后.*未生成计算轮次/);
+assert.match(describeFlowEvent({...byId.get(50),view:{...byId.get(50).view,instance:null}},byId).meaning,/归属未确定/);
+assert.equal(scheduleIndex.at(2).done,4);
+assert.equal(scheduleIndex.at(0).done,0);
+assert.equal(scheduleIndex.at(1).done,3);
 
 const reports=[];
 for(const file of process.argv.slice(2)){

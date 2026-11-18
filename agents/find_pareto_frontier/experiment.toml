@@ -1,0 +1,75 @@
+# 部署和负载沿用 run_rooflang_shared_workload.sh 的实际参数。
+# SLO、搜索范围、预算为新增初始值；可修改，不代表已验证性能或用户生产目标。
+schema_version = 1
+design_only = false
+
+[inputs]
+# 原生场景内包含模型、GPU 分配、拓扑、P/D batch 和 token 预算。
+scenario = "agents/find_pareto_frontier/scenarios/shared-workload.toml"
+assets = []
+baseline_policy = "current_reference"
+
+[model_assumptions]
+length_model = "known_trace"
+scheduler_cost = "zero_simulated_time"
+
+[slo]
+# 初始目标：TTFT 5s、TPOT 50ms，95% 请求同时达标。
+ttft_limit_s = 5.0
+tpot_limit_s = 0.05
+min_joint_pass_fraction = 0.95
+
+[loads]
+# 1.0 保留原始到达时间；其余倍率为新增的搜索对照点。
+arrival_rate_multipliers = [0.5, 1.0, 2.0]
+
+[[workloads]]
+id = "train-realistic"
+path = "examples/workloads/realistic.jsonl"
+split = "train"
+# 使用完整 100 条请求；没有另造 validation/holdout，不声明独立泛化验证。
+
+[policy]
+api_version = "serving-policy-v1"
+actions = ["route", "batch", "submit_kv", "wait"]
+# 初始搜索范围；场景中的基线仍是 P:128/32、D:32/32（token/batch）。
+# 物理 GPU、TP、模型和硬件成本保持固定。
+p_token_budget_bounds = [1, 512]
+d_token_budget_bounds = [1, 128]
+p_batch_bounds = [1, 64]
+d_batch_bounds = [1, 128]
+kv_inflight_bounds = [1, 8]
+max_wait_s = 0.05
+state_limit_bytes = 65536
+
+[agent]
+frontend = "codex"
+# 沿用参考 run_kimik3_agent.sh 的 agent 模型，和被模拟的 Llama 模型不同。
+model = "gpt-6.1-sol"
+cli_version = "0.166.0"
+image = "simthesizer-pareto-agent:codex-0.166.0"
+
+[search]
+# 初始上限：100 次尝试，累计 2 小时，单次 10 分钟。
+seed = 0
+max_trials = 100
+max_wall_seconds = 7200
+trial_wall_seconds = 1800
+
+[verification]
+max_trials = 20
+max_wall_seconds = 3600
+
+[container]
+# 宿主 CPU/RAM 限额，与模拟的 8 张 H200 无关。
+cpus = 8
+memory_mib = 16384
+pids_limit = 512
+parallel_trials = 1
+
+[artifacts]
+runs_root = "agents/find_pareto_frontier/runs"
+reports = false
+full_graphs = false
+diagnostic_budget_mib = 0
+# 后续评测器始终保留 result.jsonl、metrics.json 和指标图。

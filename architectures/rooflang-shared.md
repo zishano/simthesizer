@@ -84,9 +84,11 @@ implemented. No agent policy or search loop is included.
 
 ## Evidence and observations
 
-Inspection defaults to metrics and their plot: `result.jsonl`, `metrics.json`,
-`metrics.png`, configuration, workload, runtime receipt and small logs. The plot
-uses request results only. It saves no historical events, audits,
+Inspection defaults to metrics and plots: `result.jsonl`, `metrics.json`,
+`metrics.png`, `throughput.png`, configuration, workload, runtime receipt and small logs.
+The standalone throughput plot places each run at (mean tokens/s/user, tokens/s/GPU),
+normalizing GPU throughput by all allocated P/D devices. Both plots use request
+results; GPU counts come from the saved configuration. It saves no historical events, audits,
 CSV or HTML. The serving simulation and runtime correctness checks remain active.
 Metrics cannot reconstruct an unsaved execution history.
 
@@ -116,7 +118,10 @@ time. Source retention, decode extension and release use native lifecycle events
 Control ownership follows same-instance dependency components anchored by round
 metadata; ambiguous or missing ownership stays explicitly unassigned. Indexed
 replay supports backward seeks without retaining full state snapshots per moment.
-Module selection filters native nodes and opens their existing details.
+Module selection filters native nodes and opens their existing details. The module
+event list explains every occurrence, including future events and scheduling checks
+that produce no round. Counts and statuses share the global cursor; native dispatch
+sequence orders simultaneous starts without implying extra dependencies.
 
 Checks cover dependencies, stream exclusion, service lower bounds, capacity,
 source lifetime, byte conservation and drain. Runtime enforces KV readiness.

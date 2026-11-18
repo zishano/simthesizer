@@ -7,6 +7,34 @@ const FLOW_LABELS = {
   unassigned:'未归属逻辑'
 };
 
+const FLOW_EVENTS = {
+  RequestArrival:['请求到达（RA）','把请求交给当前实例，建立请求状态。'],
+  SubRequestArrival:['子请求到达（SA）','启动子请求；LLM 调用随后进入入队事件。'],
+  LlmEnqueue:['请求入队（EQ）','把 LLM 子请求交给调度器，并触发一次调度。'],
+  LlmSchedule:['调度（SCH）','检查可运行请求，尝试组 batch。'],
+  LlmBatchComplete:['批次完成（BC）','提交本轮 token 进度，处理完成的子请求，再次触发调度。'],
+  SubRequestComplete:['子请求完成（SC）','记录当前实例内的子请求结果，通知上层系统。'],
+  RooflangRoundBegin:['轮次开始','本轮通过资源准入，开始执行批次算子。'],
+  RooflangRoundEnd:['轮次结束','本轮计算与通信完成，交回批次控制逻辑。'],
+  Handoff:['P → D 交接','P 产出首 token 后，将后续生成交给 D；KV 按层就绪后可读。'],
+  RequestComplete:['请求完成','P/D 服务完成请求，结束请求生命周期。'],
+  Read:['读取 KV','检查所需 KV 区间可读，满足后放行依赖它的计算。'],
+  Produce:['生成 KV','注意力计算完成后，登记新生成的 KV。'],
+  Ack:['确认 KV 接收','确认目标 KV 已就绪；源 KV 满足释放条件后回收。'],
+  copy:['KV 传输','通过硬件路径复制 KV 分片，占用链路及源、目标 HBM。']
+};
+
+function describeFlowEvent(n,byId) {
+  const event=n.view.flow_event,known=FLOW_EVENTS[event];
+  let [label,meaning]=known||[n.view.name,n.view.category==='tp'?'执行本轮 TP 通信。':n.view.category==='operator'?'执行本轮算子，消耗计算 / HBM 资源。':'保留原生事件；具体作用见节点完整记录。'];
+  if(event==='LlmSchedule'){
+    const source=byId.get(n.cause)?.view.flow_event;
+    meaning=(source==='LlmBatchComplete'?'上一批次完成后再次检查可运行请求。':source==='LlmEnqueue'?'请求入队后检查可运行请求。':meaning)+
+      (n.view.round!=null?`本次生成轮次 ${n.view.round}。`:n.view.instance===null?'轮次归属未确定，见原生记录。':'本次未生成计算轮次。');
+  }
+  return {label,meaning};
+}
+
 function flowBound(list, t, key, inclusive=true) {
   let lo=0,hi=list.length;
   while(lo<hi){const mid=(lo+hi)>>1,v=key(list[mid]);if(v<t||(inclusive&&v===t))lo=mid+1;else hi=mid;}
@@ -15,7 +43,7 @@ function flowBound(list, t, key, inclusive=true) {
 
 class FlowIntervalIndex {
   constructor(items) {
-    const tie=(a,b)=>(a.id>b.id)-(a.id<b.id);
+    const tie=(a,b)=>(a.dispatches?.[0]?.[0]??0)-(b.dispatches?.[0]?.[0]??0)||(a.id>b.id)-(a.id<b.id);
     this.starts=[...items].sort((a,b)=>a.start-b.start||tie(a,b));
     this.ends=[...items].sort((a,b)=>a.finish-b.finish||tie(a,b));
     this.instants=this.starts.filter(n=>n.start===n.finish);
@@ -97,6 +125,53 @@ function toggleModuleSize() {
   $('moduleExpand').setAttribute('aria-pressed',String(on));
 }
 
+let moduleEventPage=0;
+const MODULE_EVENT_PAGE_SIZE=12;
+
+function renderModuleDetails() {
+  const outer=$('moduleDetails'),key=$('moduleFilter').value,index=flowModel.groups[key];
+  outer.hidden=!index;
+  if(!index){delete outer.dataset.module;return;}
+  const changed=outer.dataset.module!==key,items=index.starts,t=time(),state=index.at(t);
+  const scheduling=key.endsWith('_schedule'),unit=scheduling?'调度事件':'原生事件';
+  if(changed){moduleEventPage=0;delete outer.dataset.rows;}
+  if($('follow').checked&&outer.dataset.selected!==String(selected)){
+    const position=items.findIndex(n=>n.id===selected);
+    if(position>=0)moduleEventPage=Math.floor(position/MODULE_EVENT_PAGE_SIZE);
+  }
+  outer.dataset.module=key;outer.dataset.selected=String(selected);
+  const pages=Math.max(1,Math.ceil(items.length/MODULE_EVENT_PAGE_SIZE));
+  moduleEventPage=Math.max(0,Math.min(moduleEventPage,pages-1));
+  if(changed){
+    const counts=new Map();
+    for(const n of items){const label=FLOW_EVENTS[n.view.flow_event]?.[0]||category[n.view.category]||'其他';counts.set(label,(counts.get(label)||0)+1);}
+    outer.innerHTML=`<div class="row"><strong>${esc(FLOW_LABELS[key])} · 事件明细</strong><span class="spacer"></span><button id="closeModuleDetails" title="清除模块筛选">关闭</button></div><p id="moduleEventProgress"></p><p class="muted">${scheduling?'已完成 / 本次运行的事件总数；同类事件每次触发均单独计数。':'以下为本模块的原生事件；卡片中的请求、轮次或 KV 统计仍按各自单位计算。'}</p><p class="muted">${esc([...counts].map(([label,count])=>`${label} × ${count}`).join(' · '))||'本次没有此模块的原生事件。'}</p><ol id="moduleEventList"></ol><div class="row pager" id="moduleEventPager"><button id="moduleEventPrev">上一页</button><small id="moduleEventPage"></small><button id="moduleEventNext">下一页</button></div><small>按开始时间、同刻原生调度序号排列；并发不表示串行依赖。点击节点看下方详情，“查看依赖”可查看前后关系。</small>`;
+    $('closeModuleDetails').onclick=()=>{$('moduleFilter').value='';timelineChanged();};
+    $('moduleEventPrev').onclick=()=>{moduleEventPage--;renderModuleDetails();outer.scrollTop=0;};
+    $('moduleEventNext').onclick=()=>{moduleEventPage++;renderModuleDetails();outer.scrollTop=0;};
+  }
+  $('moduleEventProgress').textContent=`${unit}：已完成 ${state.done} / ${state.total} · 当前 +${ms(t)} ms`;
+  const start=moduleEventPage*MODULE_EVENT_PAGE_SIZE,shown=items.slice(start,start+MODULE_EVENT_PAGE_SIZE),rows=shown.map(n=>n.id).join(',');
+  if(outer.dataset.rows!==rows){
+    outer.dataset.rows=rows;
+    $('moduleEventList').innerHTML=shown.map((n,i)=>{
+      const info=describeFlowEvent(n,nodes),context=[n.view.instance,n.view.round!=null?`轮 ${n.view.round}`:null,n.view.requests.length?`请求 ${n.view.requests.map(id=>'#'+id).join(', ')}`:null].filter(Boolean).join(' · ');
+      const source=nodes.get(n.cause),creator=source?` · 创建者 <button data-node="${source.id}" title="查看创建此节点的事件">#${source.id} ${esc(FLOW_EVENTS[source.view.flow_event]?.[0]||compact(source))}</button>`:'';
+      return `<li data-event-id="${n.id}"><div class="row"><span class="muted">${start+i+1}.</span><button data-node="${n.id}" title="查看下方节点详情">#${n.id}</button><strong title="${esc(n.view.name)}">${esc(info.label)}</strong><span class="spacer"></span><span data-event-status></span></div><p>${esc(info.meaning)}</p><small>${esc(context)}${creator}</small><div class="muted">${n.start===n.finish?`发生 +${ms(n.start)} ms（瞬时）`:`开始 +${ms(n.start)} → 结束 +${ms(n.finish)} ms`}</div></li>`;
+    }).join('');
+    buttons($('moduleEventList'));
+  }
+  for(const row of $('moduleEventList').children){
+    const n=nodes.get(Number(row.dataset.eventId)),pulse=n.start===t&&n.finish===t,cell=row.querySelector('[data-event-status]');
+    cell.textContent=status(n)+(pulse?' · 本刻':'');
+    row.classList.toggle('selected',n.id===selected);row.classList.toggle('event-running',active(n));row.classList.toggle('event-pulse',pulse);
+  }
+  $('moduleEventPager').hidden=pages===1;
+  $('moduleEventPage').textContent=`${start+1}–${start+shown.length} / ${items.length}`;
+  $('moduleEventPrev').disabled=moduleEventPage===0;$('moduleEventNext').disabled=moduleEventPage===pages-1;
+  if(changed)outer.scrollTop=0;
+}
+
 function renderModules() {
   if($('modules-panel').hidden)return;
   const s=flowModel.at(time()),g=s.groups,kv=s.kv;
@@ -113,7 +188,7 @@ function renderModules() {
     const card={key,title:FLOW_LABELS[key],lines:[],state:on?'running':group.pulse.length?'pulse':group.done?'idle':'future',pulse:group.pulse.length>0,done:group.done,total:group.total};
     if(key.endsWith('_schedule')){
       const q=s.queues[side];
-      card.lines=[`队列 ${q?.waiting??'—'} · 已接纳 ${q?.admitted??'—'}`,`逻辑 ${group.done} / ${group.total}`];
+      card.lines=[`队列 ${q?.waiting??'—'} · 已接纳 ${q?.admitted??'—'}`,`调度事件 ${group.done} / ${group.total}`];
       if(q?.waiting&&!card.pulse)card.state='waiting';
       card.extra=data.instances.filter(i=>i.side===side).map(i=>`${i.id} · ${i.gpu_model} · TP=${i.tp}`).join('；');
     }else if(key.endsWith('_control')){
@@ -178,7 +253,7 @@ function renderModules() {
     const style=state||(type==='data'?'data':'idle');
     svg+=`<g data-flow-edge="${id}" data-state="${state||'idle'}" class="module-edge ${type} ${state}"><path d="${path}" marker-end="url(#moduleArrow-${style})"/>${label?`<text x="${x}" y="${y}" text-anchor="middle">${esc(label)}</text>`:''}</g>`;
   }
-  const selectedModule=nodes.get(selected)?.view.flow;
+  const selectedModule=$('moduleFilter').value||nodes.get(selected)?.view.flow;
   const short=text=>text.length>23?text.slice(0,22)+'…':text;
   for(const [key,[x,y]] of Object.entries(positions)){
     const c=cards[key];if(key==='unassigned'&&!c.total)continue;
@@ -203,4 +278,4 @@ function renderModules() {
   });
 }
 
-if(typeof module!=='undefined'&&module.exports)module.exports={FlowIntervalIndex,ModuleFlowModel};
+if(typeof module!=='undefined'&&module.exports)module.exports={FlowIntervalIndex,ModuleFlowModel,describeFlowEvent};

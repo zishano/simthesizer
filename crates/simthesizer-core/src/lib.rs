@@ -5,6 +5,7 @@ pub mod model_runners;
 pub mod models;
 pub mod module;
 pub mod network_sims;
+pub mod policies;
 pub mod registry;
 pub mod resources;
 pub mod routers;

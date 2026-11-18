@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::compute_sim::ComputeSimulator;
 use crate::module::LogicalHandler;
@@ -43,6 +43,10 @@ struct Node {
 }
 
 enum NodeKind {
+    /// A real external condition, released only by its owning component.
+    Condition {
+        held: bool,
+    },
     Resource(crate::resources::Work),
     Compute {
         simulator: *mut dyn ComputeSimulator,
@@ -71,6 +75,7 @@ struct QueueEntry {
 
 #[derive(Clone, Copy)]
 enum EntryKind {
+    Condition,
     Resource,
     Compute,
     Network,
@@ -172,6 +177,36 @@ impl Graph {
 
     pub fn is_pending(&self, node: NodeID) -> bool {
         self.nodes.contains_key(&node)
+    }
+
+    pub fn now(&self) -> f64 {
+        self.clock
+    }
+
+    /// The extra indegree is a condition token, not a runnable placeholder.
+    /// An unreleased token remains in the graph and fails the drain check.
+    pub fn add_condition(&mut self) -> NodeID {
+        let id = self.insert_node(NodeKind::Condition { held: true }, 0.0);
+        self.nodes.get_mut(&id).unwrap().indegree = 1;
+        id
+    }
+
+    pub fn release_condition(&mut self, condition: NodeID, cause: NodeID) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(&condition)
+            .context("missing condition node")?;
+        let NodeKind::Condition { held } = &mut node.kind else {
+            bail!("node {condition} is not a condition");
+        };
+        anyhow::ensure!(*held, "condition {condition} released twice");
+        *held = false;
+        node.indegree -= 1;
+        self.add_edge(cause, condition)?;
+        if self.tracing_enabled() {
+            self.record(json!({"event":"condition_release","node":condition,"cause_node":cause}));
+        }
+        Ok(())
     }
 
     pub fn kv_event(&mut self, event: crate::kv::Event, current: NodeID) -> Result<()> {
@@ -293,6 +328,9 @@ impl Graph {
         self.next_node_id += 1;
         if self.trace.is_some() {
             let details = match &kind {
+                NodeKind::Condition { held } => {
+                    json!({"kind":"logical", "label":"KV ready condition", "held":held})
+                }
                 NodeKind::Resource(work) => {
                     json!({"kind":"resource", "label":work.details.get("name").and_then(Value::as_str).unwrap_or("resource"), "work":work})
                 }
@@ -351,9 +389,20 @@ impl Engine {
     /// Observe after all events at a timestamp, including zero-duration descendants.
     /// The callback also receives time zero for an empty or delayed workload.
     pub fn run_with_observer(
+        self,
+        observe: impl FnMut(f64, &dyn System) -> Result<()>,
+    ) -> Result<Vec<RequestResult>> {
+        self.run_with_summary(observe).map(|(results, _)| results)
+    }
+
+    /// Read the aggregate policy counters once, after all work has drained.
+    pub fn run_with_summary(
         mut self,
         mut observe: impl FnMut(f64, &dyn System) -> Result<()>,
-    ) -> Result<Vec<RequestResult>> {
+    ) -> Result<(
+        Vec<RequestResult>,
+        Option<crate::policies::PolicyStatistics>,
+    )> {
         self.graph.check_trace(false)?;
         let mut queue = self.ready_queue()?;
         let mut last_observed = None;
@@ -414,12 +463,16 @@ impl Engine {
                 self.graph.nodes.len()
             );
         }
+        let mut statistics = self.system.policy_statistics();
+        if let Some(statistics) = &mut statistics {
+            statistics.simulation_end_s = Some(self.graph.clock);
+        }
         let results = self.system.into_results()?;
         if self.graph.trace.is_some() {
             self.graph.record(json!({"event":"run_complete"}));
         }
         self.graph.check_trace(true)?;
-        Ok(results)
+        Ok((results, statistics))
     }
 
     fn ready_queue(&self) -> Result<BinaryHeap<QueueEntry>> {
@@ -447,6 +500,13 @@ impl Engine {
         queue: &mut BinaryHeap<QueueEntry>,
     ) -> Result<()> {
         match self.entry_kind(entry.node_id)? {
+            EntryKind::Condition => {
+                let NodeKind::Condition { held } = self.graph.nodes[&entry.node_id].kind else {
+                    unreachable!()
+                };
+                anyhow::ensure!(!held, "unreleased condition was scheduled");
+                self.complete_node(entry.node_id, entry.time, 0.0, queue)
+            }
             EntryKind::Resource => {
                 let node = self.graph.nodes.get(&entry.node_id).unwrap();
                 let NodeKind::Resource(work) = &node.kind else {
@@ -467,6 +527,7 @@ impl Engine {
             .get(&node_id)
             .ok_or_else(|| anyhow!("queued node {node_id} is missing"))?;
         match &node.kind {
+            NodeKind::Condition { .. } => Ok(EntryKind::Condition),
             NodeKind::Resource(_) => Ok(EntryKind::Resource),
             NodeKind::Compute { .. } => Ok(EntryKind::Compute),
             NodeKind::Network { .. } => Ok(EntryKind::Network),

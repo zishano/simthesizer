@@ -15,15 +15,21 @@ use crate::write_jsonl::write_results_jsonl;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long)]
-    config: PathBuf,
+    /// Print the native serving-policy contract without starting a simulation.
+    #[arg(long, exclusive = true)]
+    policy_capabilities: bool,
+    #[arg(long, required_unless_present = "policy_capabilities")]
+    config: Option<PathBuf>,
     /// Stream completed root-request counts to stderr.
     #[arg(long)]
     progress: bool,
+    #[arg(long, required_unless_present = "policy_capabilities")]
+    workload: Option<PathBuf>,
+    #[arg(long, required_unless_present = "policy_capabilities")]
+    output_jsonl: Option<PathBuf>,
+    /// Aggregate decision counts and wall-clock overhead, written once at completion.
     #[arg(long)]
-    workload: PathBuf,
-    #[arg(long)]
-    output_jsonl: PathBuf,
+    output_policy_stats: Option<PathBuf>,
     /// Component state at the engine clock, as JSONL.
     #[arg(long)]
     output_engine_trace: Option<PathBuf>,
@@ -40,7 +46,19 @@ struct Config {
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
-    args.output_jsonl = output_path(&args.output_jsonl)?;
+    if args.policy_capabilities {
+        println!(
+            "{}",
+            serde_json::json!({
+                "policy_api_version": simthesizer_core::policies::API_VERSION,
+                "actions": ["route", "batch", "submit_kv", "wait"],
+                "length_model": "known_trace", "scheduler_cost": "zero_simulated_time",
+                "validates_actions": true, "checks_full_completion": true
+            })
+        );
+        return Ok(());
+    }
+    let output_jsonl = output_path(args.output_jsonl.as_ref().unwrap())?;
     args.output_engine_trace = args
         .output_engine_trace
         .as_deref()
@@ -52,10 +70,7 @@ fn main() -> Result<()> {
             "trace output already exists: {}",
             path.display()
         );
-        anyhow::ensure!(
-            path != &args.output_jsonl,
-            "trace and result paths must differ"
-        );
+        anyhow::ensure!(path != &output_jsonl, "trace and result paths must differ");
     }
     args.output_graph_trace = args
         .output_graph_trace
@@ -69,12 +84,26 @@ fn main() -> Result<()> {
             path.display()
         );
         anyhow::ensure!(
-            path != &args.output_jsonl && Some(path) != args.output_engine_trace.as_ref(),
+            path != &output_jsonl && Some(path) != args.output_engine_trace.as_ref(),
             "graph trace, engine trace and result paths must differ"
         );
     }
-    let config_path = args.config;
-    let workload_path = args.workload;
+    let policy_stats_path = args
+        .output_policy_stats
+        .as_deref()
+        .map(output_path)
+        .transpose()?;
+    if let Some(path) = &policy_stats_path {
+        anyhow::ensure!(!path.exists(), "policy statistics output already exists");
+        anyhow::ensure!(
+            path != &output_jsonl
+                && Some(path) != args.output_engine_trace.as_ref()
+                && Some(path) != args.output_graph_trace.as_ref(),
+            "output paths must differ"
+        );
+    }
+    let config_path = args.config.unwrap();
+    let workload_path = args.workload.unwrap();
     let mut config = load_config(&config_path)?;
     let system_base_path = config_path
         .parent()
@@ -97,7 +126,7 @@ fn main() -> Result<()> {
     progress.observe(0.0, config.system.as_ref())?;
 
     let engine = Engine::new(graph, config.system);
-    let results = if let Some(path) = &args.output_engine_trace {
+    let (results, statistics) = if let Some(path) = &args.output_engine_trace {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -105,7 +134,7 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         let mut trace = write_trace::TraceWriter::new(std::io::BufWriter::new(file.as_file_mut()));
-        let results = engine.run_with_observer(|time, system| {
+        let results = engine.run_with_summary(|time, system| {
             progress.observe(time, system)?;
             trace.observe(time, system.observe())
         })?;
@@ -113,12 +142,17 @@ fn main() -> Result<()> {
         file.persist_noclobber(path)?;
         results
     } else if args.progress {
-        engine.run_with_observer(|time, system| progress.observe(time, system))?
+        engine.run_with_summary(|time, system| progress.observe(time, system))?
     } else {
-        engine.run()?
+        engine.run_with_summary(|_, _| Ok(()))?
     };
 
-    write_results_jsonl(&args.output_jsonl, &results)?;
+    write_results_jsonl(&output_jsonl, &results)?;
+    if let Some(path) = policy_stats_path {
+        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+        serde_json::to_writer(file.as_file_mut(), &statistics)?;
+        file.persist_noclobber(path)?;
+    }
     if let Some(file) = graph_file {
         file.persist_noclobber(args.output_graph_trace.as_ref().unwrap())?;
     }

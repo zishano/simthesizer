@@ -1,6 +1,8 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,10 @@ use crate::engine::Graph;
 use crate::model::Model;
 use crate::module::{LogicalHandler, Module};
 use crate::network_sim::NetworkSimulator;
+use crate::policies::{
+    InstanceId, PolicyConfig, PolicyRuntime, PolicyStatistics, RouteAction, RouteObservation,
+    SharedPolicy, Stage,
+};
 use crate::system::{System, SystemEvent};
 use crate::types::{
     NetworkDeviceID, NodeID, ParallelStrategy, Request, RequestResult, ResultSubRequest, SubRequest,
@@ -35,6 +41,17 @@ pub struct PdDisaggregationSystem {
     link_latency: Option<f64>,
     #[serde(default)]
     kv_topology: Option<KvTopology>,
+
+    #[serde(default)]
+    policy: Option<PolicyConfig>,
+    #[serde(skip)]
+    policy_runtime: Option<SharedPolicy>,
+    #[serde(skip)]
+    policy_graph_bound: bool,
+    #[serde(skip)]
+    incoming: HashMap<u64, IncomingRequest>,
+    #[serde(skip)]
+    decode_reserved: Vec<usize>,
 
     #[serde(skip_deserializing, default)]
     prefill_device_ids: Vec<NetworkDeviceID>,
@@ -175,6 +192,11 @@ struct PendingRequest {
     sink: Option<*mut dyn LogicalHandler>,
 }
 
+struct IncomingRequest {
+    request: Request,
+    sink: Option<*mut dyn LogicalHandler>,
+}
+
 struct LlmTokenData<'a> {
     input_tokens: u32,
     output_tokens: u32,
@@ -184,6 +206,9 @@ struct LlmTokenData<'a> {
 
 #[derive(Debug)]
 enum LogicalPayload {
+    RequestArrival {
+        request_id: u64,
+    },
     TransferComplete {
         request_id: u64,
     },
@@ -484,6 +509,9 @@ impl PdDisaggregationSystem {
                     pending.prefill_result = Some((result, now));
                     pending.decode_request = Some(decode_request.clone());
                     let index = pending.decode_instance.unwrap();
+                    if self.policy_runtime.is_some() {
+                        self.decode_reserved[index] -= 1;
+                    }
                     let sink = self as *mut Self as *mut dyn LogicalHandler;
                     self.decode_instances[index].add_request_arrival(
                         decode_request,
@@ -647,6 +675,48 @@ impl LogicalHandler for PdDisaggregationSystem {
         graph: &mut Graph,
     ) -> Result<f64> {
         match parse_payload(payload)? {
+            HandlerPayload::Internal(LogicalPayload::RequestArrival { request_id }) => {
+                let incoming = self
+                    .incoming
+                    .remove(&request_id)
+                    .ok_or_else(|| anyhow!("missing policy arrival {request_id}"))?;
+                let policy = self
+                    .policy_runtime
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("policy arrival without policy"))?
+                    .clone();
+                let route = if policy.borrow().is_reference() {
+                    policy.borrow_mut().record_reference_route();
+                    None
+                } else {
+                    let prefill = self
+                        .prefill_instances
+                        .iter()
+                        .map(|s| s.instance_load())
+                        .collect::<Vec<_>>();
+                    let decode = self
+                        .decode_instances
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            let mut load = s.instance_load();
+                            load.waiting_requests += self.decode_reserved[i];
+                            load.waiting_tokens += self.decode_reserved[i] as u64;
+                            load
+                        })
+                        .collect::<Vec<_>>();
+                    let (input_tokens, _) = Self::single_llm_tokens(&incoming.request)?;
+                    Some(policy.borrow_mut().route(&RouteObservation {
+                        now,
+                        request_id,
+                        input_tokens,
+                        prefill: &prefill,
+                        decode: &decode,
+                    })?)
+                };
+                self.enroll_request(incoming.request, graph, Some(current), incoming.sink, route)?;
+                Ok(0.0)
+            }
             HandlerPayload::Internal(LogicalPayload::KvSlice {
                 request_id,
                 head_start,
@@ -687,7 +757,19 @@ impl Module for PdDisaggregationSystem {
 }
 
 impl System for PdDisaggregationSystem {
+    fn policy_statistics(&self) -> Option<PolicyStatistics> {
+        self.policy_runtime
+            .as_ref()
+            .map(|p| p.borrow().statistics())
+    }
+
     fn prepare_graph(&mut self, graph: &mut Graph) -> Result<()> {
+        if !self.policy_graph_bound {
+            if let Some(policy) = &self.policy_runtime {
+                graph.kv.configure_policy(policy.clone())?;
+                self.policy_graph_bound = true;
+            }
+        }
         for instance in self
             .prefill_instances
             .iter_mut()
@@ -710,6 +792,10 @@ impl System for PdDisaggregationSystem {
     }
 
     fn init(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.policy.is_none() || self.shared_execution,
+            "serving policy requires shared P/D execution"
+        );
         anyhow::ensure!(
             !self.allow_gpu_sharing || self.shared_execution,
             "GPU sharing requires shared execution"
@@ -750,6 +836,21 @@ impl System for PdDisaggregationSystem {
         self.results.clear();
         self.prefill_device_ids.clear();
         self.decode_device_ids.clear();
+        self.incoming.clear();
+        self.decode_reserved = vec![0; self.decode_instances.len()];
+        self.policy_graph_bound = false;
+        if let Some(config) = &self.policy {
+            let policy = Rc::new(RefCell::new(PolicyRuntime::new(config.clone())?));
+            for (stage, instances) in [
+                (Stage::Prefill, &mut self.prefill_instances),
+                (Stage::Decode, &mut self.decode_instances),
+            ] {
+                for (index, instance) in instances.iter_mut().enumerate() {
+                    instance.configure_policy(policy.clone(), InstanceId { stage, index })?;
+                }
+            }
+            self.policy_runtime = Some(policy);
+        }
         self.model.init(ParallelStrategy {
             tp: self.tp,
             pp: 1,
@@ -828,14 +929,63 @@ impl System for PdDisaggregationSystem {
         {
             bail!("pd_disaggregation does not support external seeded progress");
         }
-        if self.pending_requests.contains_key(&request.request_id) {
+        if self.pending_requests.contains_key(&request.request_id)
+            || self.incoming.contains_key(&request.request_id)
+        {
             bail!(
                 "pd_disaggregation received duplicate request id {}",
                 request.request_id
             );
         }
 
-        let prefill_instance = self.choose_prefill_instance()?;
+        if self.policy_runtime.is_some() {
+            Self::single_llm_tokens(&request)?;
+            let request_id = request.request_id;
+            let arrival_time = request.arrival_time;
+            self.incoming
+                .insert(request_id, IncomingRequest { request, sink });
+            let arrival = graph.add_logical_node_at(
+                self as *mut Self as *mut dyn LogicalHandler,
+                LogicalPayload::RequestArrival { request_id },
+                arrival_time,
+            );
+            if let Some(parent) = parent {
+                graph.add_edge(parent, arrival)?;
+            }
+            return Ok(());
+        }
+
+        self.enroll_request(request, graph, parent, sink, None)
+    }
+
+    fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
+        anyhow::ensure!(
+            self.incoming.is_empty(),
+            "pd_disaggregation finished before all policy arrivals"
+        );
+        if !self.pending_requests.is_empty() {
+            bail!(
+                "pd_disaggregation finished with {} incomplete requests",
+                self.pending_requests.len()
+            );
+        }
+        Ok(self.results)
+    }
+}
+
+impl PdDisaggregationSystem {
+    fn enroll_request(
+        &mut self,
+        request: Request,
+        graph: &mut Graph,
+        parent: Option<NodeID>,
+        sink: Option<*mut dyn LogicalHandler>,
+        route: Option<RouteAction>,
+    ) -> Result<()> {
+        let prefill_instance = match route {
+            Some(route) => route.prefill,
+            None => self.choose_prefill_instance()?,
+        };
         let request_id = request.request_id;
         let prefill_request = Self::build_prefill_request(&request)?;
         let mut pending =
@@ -845,11 +995,19 @@ impl System for PdDisaggregationSystem {
             let (input, output) = Self::single_llm_tokens(&pending.original)?;
             anyhow::ensure!(input > 0, "shared KV requires nonempty input");
             let decode = if output > 1 {
-                Some(self.choose_decode_instance()?)
+                Some(match route {
+                    Some(route) => route.decode,
+                    None => self.choose_decode_instance()?,
+                })
             } else {
                 None
             };
             pending.decode_instance = decode;
+            if self.policy_runtime.is_some() {
+                if let Some(index) = decode {
+                    self.decode_reserved[index] += 1;
+                }
+            }
             let topology = self.kv_topology.as_ref().unwrap();
             let mut routes = Vec::new();
             if let Some(decode) = decode {
@@ -931,21 +1089,261 @@ impl System for PdDisaggregationSystem {
 
         Ok(())
     }
-
-    fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
-        if !self.pending_requests.is_empty() {
-            bail!(
-                "pd_disaggregation finished with {} incomplete requests",
-                self.pending_requests.len()
-            );
-        }
-        Ok(self.results)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PdDisaggregationSystem, Request, SubRequest};
+    use super::*;
+    use crate::types::{InstanceLoad, Layer};
+
+    struct RouteModel;
+    impl Module for RouteModel {}
+    impl Model for RouteModel {
+        fn init(&mut self, _: ParallelStrategy) -> Result<()> {
+            Ok(())
+        }
+        fn weight_bytes_per_device(&self) -> u64 {
+            0
+        }
+        fn kv_bytes_per_token_per_device(&self) -> u64 {
+            2
+        }
+        fn pre_block_layers(&self) -> &[Layer] {
+            &[]
+        }
+        fn block_layers(&self) -> &[Layer] {
+            &[]
+        }
+        fn post_block_layers(&self) -> &[Layer] {
+            &[]
+        }
+        fn num_blocks(&self) -> u32 {
+            1
+        }
+    }
+
+    type Assignments = Rc<RefCell<Vec<(u64, usize, f64)>>>;
+    struct RouteChild {
+        index: usize,
+        assignments: Assignments,
+        queued: HashMap<u64, u32>,
+    }
+    struct Finish {
+        request: Request,
+        sink: *mut dyn LogicalHandler,
+    }
+    impl Module for RouteChild {}
+    impl LogicalHandler for RouteChild {
+        fn handle(
+            &mut self,
+            payload: Box<dyn Any>,
+            now: f64,
+            current: NodeID,
+            graph: &mut Graph,
+        ) -> Result<f64> {
+            let Finish { request, sink } = *payload.downcast::<Finish>().unwrap();
+            let tokens = self.queued.remove(&request.request_id).unwrap();
+            graph.kv_event(
+                crate::kv::Event::Produce {
+                    request: request.request_id,
+                    prefill: true,
+                    layer: 0,
+                    rank: 0,
+                    start: 0,
+                    end: tokens,
+                },
+                current,
+            )?;
+            let result = RequestResult {
+                request_id: request.request_id,
+                arrival_time: request.arrival_time,
+                initial: vec![0],
+                sub_requests: vec![ResultSubRequest::Llm {
+                    input_tokens: tokens,
+                    output_tokens: 1,
+                    token_latency: vec![now - request.arrival_time],
+                    next: vec![],
+                    interval: None,
+                    model: None,
+                }],
+            };
+            let done =
+                graph.add_logical_node(sink, SystemEvent::RequestCompleted { request, result });
+            graph.add_edge(current, done)?;
+            Ok(0.0)
+        }
+    }
+    impl System for RouteChild {
+        fn configure_policy(&mut self, _: SharedPolicy, _: InstanceId) -> Result<()> {
+            Ok(())
+        }
+        fn shared_execution(&self) -> bool {
+            true
+        }
+        fn init(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn instance_load(&self) -> InstanceLoad {
+            InstanceLoad {
+                waiting_requests: self.queued.len(),
+                waiting_tokens: self.queued.values().map(|&v| u64::from(v)).sum(),
+                ..Default::default()
+            }
+        }
+        fn add_request_arrival(
+            &mut self,
+            request: Request,
+            graph: &mut Graph,
+            parent: Option<NodeID>,
+            sink: Option<*mut dyn LogicalHandler>,
+        ) -> Result<()> {
+            self.assignments
+                .borrow_mut()
+                .push((request.request_id, self.index, graph.now()));
+            let tokens = request.total_input_tokens();
+            self.queued.insert(request.request_id, tokens);
+            let finish = graph.add_logical_node_at(
+                self as *mut dyn LogicalHandler,
+                Finish {
+                    request,
+                    sink: sink.unwrap(),
+                },
+                graph.now() + f64::from(tokens),
+            );
+            if let Some(parent) = parent {
+                graph.add_edge(parent, finish)?;
+            }
+            Ok(())
+        }
+        fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
+            anyhow::ensure!(self.queued.is_empty(), "route fixture has unfinished work");
+            Ok(vec![])
+        }
+    }
+
+    fn routed_run(future_arrival: f64) -> Vec<(u64, usize, f64)> {
+        let assignments = Assignments::default();
+        let children = || {
+            (0..2)
+                .map(|index| {
+                    Box::new(RouteChild {
+                        index,
+                        assignments: assignments.clone(),
+                        queued: HashMap::new(),
+                    }) as Box<dyn System>
+                })
+                .collect()
+        };
+        let mut system = Box::new(PdDisaggregationSystem {
+            shared_execution: true,
+            allow_gpu_sharing: false,
+            kv_handoff: "whole".into(),
+            prefill_instances: children(),
+            decode_instances: children(),
+            model: Box::new(RouteModel),
+            tp: 1,
+            network_sim: serde_json::from_value(serde_json::json!({"kind":"flow"})).unwrap(),
+            link_bw: None,
+            link_latency: None,
+            kv_topology: Some(KvTopology {
+                devices: vec!["p0".into(), "p1".into(), "d0".into(), "d1".into()],
+                shards: 1,
+                prefill_gpus: vec![vec![0], vec![1]],
+                decode_gpus: vec![vec![2], vec![3]],
+                links: (0..4)
+                    .map(|i| KvLink {
+                        resource: Some(format!("link{i}")),
+                        src: i / 2,
+                        dst: i % 2 + 2,
+                        bandwidth: 100.0,
+                        latency: 0.0,
+                    })
+                    .collect(),
+                routes: (0..4)
+                    .map(|i| KvRoute {
+                        src: i / 2,
+                        dst: i % 2 + 2,
+                        links: vec![i],
+                    })
+                    .collect(),
+            }),
+            policy: Some(crate::policies::test_config()),
+            policy_runtime: None,
+            policy_graph_bound: false,
+            incoming: HashMap::new(),
+            decode_reserved: Vec::new(),
+            prefill_device_ids: Vec::new(),
+            decode_device_ids: Vec::new(),
+            next_prefill_instance: 0,
+            next_decode_instance: 0,
+            pending_requests: HashMap::new(),
+            results: Vec::new(),
+        });
+        system.init().unwrap();
+        system
+            .policy_runtime
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .set_route_for_test(|observation, _, _| {
+                let least = |loads: &[InstanceLoad]| {
+                    loads
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(i, load)| (load.total_tokens(), *i))
+                        .unwrap()
+                        .0
+                };
+                RouteAction {
+                    prefill: least(observation.prefill),
+                    decode: least(observation.decode),
+                }
+            });
+        let mut graph = Graph::new();
+        for (id, arrival_time) in [1.0, 1.5, future_arrival].into_iter().enumerate() {
+            let request = Request {
+                request_id: id as u64,
+                arrival_time,
+                initial: vec![0],
+                sub_requests: vec![SubRequest::Llm {
+                    input_tokens: 4,
+                    output_tokens: 1,
+                    known_tokens: None,
+                    kv_tokens: None,
+                    next: vec![],
+                    interval: None,
+                    model: None,
+                    input_token_ids: None,
+                    output_token_ids: None,
+                }],
+            };
+            system
+                .add_request_arrival(request, &mut graph, None, None)
+                .unwrap();
+        }
+        assert!(
+            assignments.borrow().is_empty(),
+            "routing must not inspect load while seeding future requests"
+        );
+        assert_eq!(system.policy_statistics().unwrap().route_decisions, 0);
+        let (results, statistics) = crate::Engine::new(graph, system)
+            .run_with_summary(|_, _| Ok(()))
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(statistics.unwrap().route_decisions, 3);
+        let collected = assignments.borrow().clone();
+        collected
+    }
+
+    #[test]
+    fn pd_policy_routes_at_arrival_using_current_load_and_not_future_requests() {
+        let early_future = routed_run(10.0);
+        let late_future = routed_run(20.0);
+        assert_eq!(&early_future[..2], &[(0, 0, 1.0), (1, 1, 1.5)]);
+        assert_eq!(&early_future[..2], &late_future[..2]);
+        assert_eq!(early_future[2], (2, 0, 10.0));
+        assert_eq!(late_future[2], (2, 0, 20.0));
+    }
 
     #[test]
     fn decode_handoff_excludes_sampled_token_from_kv() {

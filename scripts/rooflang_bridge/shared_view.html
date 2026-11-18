@@ -26,6 +26,7 @@ section{min-width:0;min-height:0;background:white;border:1px solid var(--border)
 .workspace{min-width:0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,26vw,390px);gap:8px}
 .main-column{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(310px,.95fr) minmax(170px,1.05fr);gap:8px}
 .timeline-panel,.detail-panel{display:flex;flex-direction:column;gap:5px;overflow:hidden}
+.detail-panel{display:grid;grid-template-rows:auto repeat(2,minmax(0,1fr))}
 .timeline-tools{flex:none}.timeline-tools label{white-space:nowrap;font-size:12px}
 .legend{flex:none;display:flex;gap:12px;flex-wrap:wrap;font-size:11px;line-height:1.5}.legend i{display:inline-block;width:8px;height:8px;margin-right:4px;border-radius:2px}
 .scroll{overflow:auto;min-width:0;min-height:0;scrollbar-gutter:stable}
@@ -53,7 +54,13 @@ section{min-width:0;min-height:0;background:white;border:1px solid var(--border)
 #nodeTable,#dependencies,#kvEvents{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable}
 table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #edf0f5;padding:4px 5px;text-align:left;white-space:nowrap}th{color:#54667b;background:#f5f8fc;position:sticky;top:0}
 td.name{max-width:220px;overflow:hidden;text-overflow:ellipsis}tr[data-node]{cursor:pointer}tr[data-node]:hover{background:#f4f7fc}tr.selected{background:#fff0e9}
-#detail{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;font-size:12px}
+#detail{min-height:0;overflow:auto;scrollbar-gutter:stable;font-size:12px}
+#moduleDetails{min-height:0;overflow:auto;scrollbar-gutter:stable;border-bottom:1px solid var(--border);padding-bottom:7px;font-size:11px;overflow-wrap:anywhere}
+#moduleDetails[hidden]+#detail{grid-row:2 / 4}
+#moduleDetails button{font-size:10px;padding:1px 4px}#moduleEventProgress{font-weight:600;color:#245b8c}
+#moduleEventList{list-style:none;margin:5px 0;padding:0}#moduleEventList li{margin:4px 0;padding:5px 6px;border:1px solid #e1e8f0;border-left:3px solid #a5b8cf;border-radius:4px;background:#f8fafd}
+#moduleEventList p{margin:3px 0;line-height:1.4}#moduleEventList .row{gap:4px}#moduleEventList strong{min-width:0;overflow-wrap:anywhere}#moduleEventList [data-event-status]{font-size:10px;color:var(--muted)}
+#moduleEventList li.selected{background:#fff4e9}#moduleEventList li.event-running{border-left-color:#16804b}#moduleEventList li.event-pulse{border-left-color:#d68a10}
 dl{display:grid;grid-template-columns:92px minmax(0,1fr);gap:4px;margin:4px 0 10px}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}
 details{border-top:1px solid #e4e9f0;margin-top:7px;padding-top:6px}summary{cursor:pointer;color:#345c8b}
 #files{display:flex;flex-wrap:wrap;gap:10px}#nodeCount{font-size:11px;color:var(--muted)}.live{color:var(--active);font-weight:600}.empty{color:var(--muted);padding:10px}
@@ -102,7 +109,7 @@ details{border-top:1px solid #e4e9f0;margin-top:7px;padding-top:6px}summary{curs
       <div id="modules-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-modules" hidden>
         <div class="module-tools"><span>绿色：执行中 · 橙色：本刻事件 · 虚线框：等待</span><span>实线：数据 / 依赖 · 虚线箭头：调度</span><span id="moduleClock"></span><button id="moduleExpand" aria-pressed="false" title="展开此图；全局时间线仍可操作。Esc 收起。">展开</button></div>
         <div id="moduleFlow"></div>
-        <small class="hint" title="始终显示全局时间线的当前状态。点击模块联动右侧详情和节点筛选；节点筛选不改变模块全局统计。进度按已完成节点、轮次或已确认分片统计。">跟随全局时间线 · 点击模块查看相关节点 · 队列计数不代表 GPU 正在执行</small>
+        <small class="hint" title="始终显示全局时间线的当前状态。点击模块查看全部事件、作用与完成状态；节点筛选不改变模块全局统计。进度按已完成节点、轮次或已确认分片统计。">跟随全局时间线 · 点击模块查看事件过程 · 队列计数不代表 GPU 正在执行</small>
       </div>
       <div id="dependency-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-dependencies" hidden>
         <div class="row"><h2>所选节点的原生依赖</h2><span class="spacer"></span><label><input id="history" type="checkbox" checked>完整依赖历史</label></div>
@@ -116,7 +123,7 @@ details{border-top:1px solid #e4e9f0;margin-top:7px;padding-top:6px}summary{curs
       <div id="files-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-files" hidden><div id="files"></div><details><summary>GPU 编号图例</summary><pre id="deviceLegend"></pre></details><footer>本页直接读取原生模拟事件，不重算算子时间。基础计算、HBM、网络成本可重叠，不能相加作为执行耗时；超出独占下界的时间也不单独归因为某一种资源。回放将同一时刻的瞬时事件合并，精确顺序见原始动态图。结果属于当前解析模型的仿真预测。</footer></div>
     </section>
    </div>
-   <section class="detail-panel"><div class="row"><h2>节点 / 批次详情</h2><span class="spacer"></span><button id="showDependencies">查看依赖</button></div><div id="detail"></div></section>
+   <section class="detail-panel"><div class="row"><h2>模块 / 节点详情</h2><span class="spacer"></span><button id="showDependencies">查看依赖</button></div><div id="moduleDetails" hidden></div><div id="detail"></div></section>
   </div>
 </main>
 <script id="data" type="application/json">__DATA__</script>
@@ -250,7 +257,7 @@ const flowModel=new ModuleFlowModel(data);
 for(const [key,label] of Object.entries(FLOW_LABELS))$('moduleFilter').add(new Option(label,key));
 $('moduleExpand').onclick=toggleModuleSize;
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('modules-panel').classList.contains('module-expanded'))toggleModuleSize();});
-function render(){const t=time();$('clock').textContent=`+${ms(t)} ms · t=${t.toFixed(9)} s`;$('step').title=`${+step.value+1}/${data.times.length} 个事件时刻`;$('completed').textContent=`请求完成 ${flowBound(flowModel.finishes,t,r=>r.finish)}/${data.requests.length}`;renderTimeline();renderState();renderTable();renderDetails();renderDependencies();renderModules();}
+function render(){const t=time();$('clock').textContent=`+${ms(t)} ms · t=${t.toFixed(9)} s`;$('step').title=`${+step.value+1}/${data.times.length} 个事件时刻`;$('completed').textContent=`请求完成 ${flowBound(flowModel.finishes,t,r=>r.finish)}/${data.requests.length}`;renderTimeline();renderState();renderTable();renderDetails();renderDependencies();renderModules();renderModuleDetails();}
 $('mode').textContent=`shared · ${data.meta.mode==='layer'?'逐层交接 layer':'整轮交接 whole'}`;
 $('coverage').textContent=`${data.nodes.length} 节点 · ${data.edges.length} 条历史依赖 · ${data.rounds.length} 轮`;
 $('deployment').textContent=data.instances.map(i=>`${i.id}：${i.gpu_model.toUpperCase()} × ${i.devices.length}，TP=${i.tp}，${i.devices.map(gpu).join('/') }，token_budget=${i.scheduler.max_num_batched_tokens}`).join('；');

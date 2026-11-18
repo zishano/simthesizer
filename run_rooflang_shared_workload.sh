@@ -9,7 +9,7 @@ WORKLOAD="examples/workloads/realistic.jsonl"
 # P 池：1 个 TP2 实例，共 2 张 H200。
 P_GPU="h200"
 P_INSTANCES=1
-P_TP=2
+P_TP=4
 P_MAX_BATCH=32
 P_TOKEN_BUDGET=128
 
@@ -17,7 +17,7 @@ P_TOKEN_BUDGET=128
 # 每轮 token 预算不限制请求的总输出长度。
 D_GPU="h200"
 D_INSTANCES=1
-D_TP=2
+D_TP=4
 D_MAX_BATCH=32
 D_TOKEN_BUDGET=32
 

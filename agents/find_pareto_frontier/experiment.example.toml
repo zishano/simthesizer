@@ -1,0 +1,82 @@
+# Launcher 配置示例，不是 inspect_rooflang.py 可读取的配置。
+# run-agent.sh 拒绝 design_only=true、未填 REQUIRED 或不支持的 API。
+# REQUIRED 字符串实填时需换成注释指定的类型；本例只保证 TOML 语法有效。
+schema_version = 1
+design_only = true
+
+[inputs]
+# 场景及其引用文件唯一决定模型、GPU、显存、拓扑、P/D 划分和 TP。
+scenario = "REQUIRED: path/to/simthesizer.toml"
+assets = [] # 显式列出场景引用的拓扑等文件；评测器按 manifest 的路径映射解析。
+baseline_policy = "current_reference"
+
+[model_assumptions]
+# A1 待确认；这是当前模型的限制，不能解释为未知输出长度服务。
+length_model = "known_trace"
+scheduler_cost = "zero_simulated_time"
+
+[slo]
+ttft_limit_s = "REQUIRED: positive finite float"
+tpot_limit_s = "REQUIRED: positive finite float"
+min_joint_pass_fraction = "REQUIRED: float in (0, 1]"
+# 单输出只检查 TTFT；零输出仍须完成但不进入延迟达标分母。
+
+[loads]
+# 固定网格，乘数 >1 表示到达更密集。开发启动前填完整对照范围。
+arrival_rate_multipliers = ["REQUIRED: positive finite floats, including 1.0"]
+
+[[workloads]]
+id = "train-realistic"
+path = "examples/workloads/realistic.jsonl"
+split = "train"
+
+[[workloads]]
+id = "validation"
+path = "REQUIRED: validation workload path"
+split = "validation"
+
+# 可选 holdout 路径由外部复验器单独配置，不渲染进 agent 可读 manifest。
+
+[policy]
+api_version = "serving-policy-v1"
+actions = ["route", "batch", "submit_kv", "wait"]
+# 所有能力须实际实现；不允许静默忽略尚未支持的动作。
+p_token_budget_bounds = ["REQUIRED: positive min", "REQUIRED: positive max"]
+d_token_budget_bounds = ["REQUIRED: positive min", "REQUIRED: positive max"]
+p_batch_bounds = ["REQUIRED: positive min", "REQUIRED: positive max"]
+d_batch_bounds = ["REQUIRED: positive min", "REQUIRED: positive max"]
+kv_inflight_bounds = ["REQUIRED: positive min", "REQUIRED: positive max"]
+max_wait_s = "REQUIRED: positive finite float"
+state_limit_bytes = "REQUIRED: positive integer"
+
+[agent]
+frontend = "codex"
+model = "REQUIRED: explicit agent model"
+cli_version = "0.166.0"
+image = "simthesizer-pareto-agent:codex-0.166.0"
+# API 凭据通过运行时 env 文件单独传入，不写在此处。
+
+[search]
+seed = 0
+max_trials = "REQUIRED: positive integer; includes failed attempts"
+max_wall_seconds = "REQUIRED: positive integer"
+trial_wall_seconds = "REQUIRED: positive integer"
+# 可选 stagnation_trials 必须为正整数；不能解释为证明最优。
+
+[verification]
+# 独立复验不无限续用搜索预算；每次尝试也受 trial_wall_seconds 限制。
+max_trials = "REQUIRED: positive integer"
+max_wall_seconds = "REQUIRED: positive integer"
+
+[container]
+cpus = "REQUIRED: positive number"
+memory_mib = "REQUIRED: positive integer"
+pids_limit = "REQUIRED: positive integer"
+parallel_trials = 1
+
+[artifacts]
+runs_root = "agents/find_pareto_frontier/runs"
+reports = false
+full_graphs = false
+# result.jsonl、metrics.json、metrics.png、throughput.png 始终保留。
+diagnostic_budget_mib = "REQUIRED: nonnegative integer"

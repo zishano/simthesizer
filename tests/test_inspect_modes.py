@@ -47,6 +47,11 @@ class InspectModesTests(unittest.TestCase):
                 self.assertTrue(
                     (root / "metrics.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
                 )
+                self.assertTrue(
+                    (root / "throughput.png")
+                    .read_bytes()
+                    .startswith(b"\x89PNG\r\n\x1a\n")
+                )
                 outputs.append(
                     (
                         (root / "result.jsonl").read_bytes(),
@@ -63,7 +68,9 @@ class InspectModesTests(unittest.TestCase):
                             "result.jsonl",
                             "metrics.json",
                             "metrics.png",
+                            "throughput.png",
                             "draw.py.log",
+                            "draw_throughput.py.log",
                             "execution.json",
                         },
                     )

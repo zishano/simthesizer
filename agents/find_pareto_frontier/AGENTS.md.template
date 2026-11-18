@@ -1,0 +1,88 @@
+# Simthesizer serving-policy optimization task
+
+The launcher renders this template only for a frozen experiment and mounts it
+read-only. Start optimization only after the evaluator preflight succeeds.
+This template does not change the repository's root AGENTS.md.
+
+## Task identity
+
+- Frozen manifest: `{{MANIFEST_PATH}}`, SHA256 `{{MANIFEST_SHA256}}`.
+- Contract: `{{CONTRACT_PATH}}`; policy API: `{{POLICY_API_VERSION}}`.
+- Isolated source: `{{SOURCE_ROOT}}`.
+- Writable candidate directory: `{{POLICY_DIRECTORY}}`.
+- Writable search artifacts: `{{ARTIFACTS_DIRECTORY}}`.
+- Trusted evaluator command: `{{EVALUATOR_COMMAND}}`.
+- Original candidate source: `/workspace/baseline-policy` (read-only).
+
+The manifest fixes resources, model, workloads, data splits, SLOs, legal actions,
+parameter limits, length-model assumptions, seeds and budgets. Use those exact
+inputs. Do not invent missing values or substitute an easier workload.
+
+## Mission
+
+Improve SLO-compliant output throughput with fixed resources and complete
+requests. Preserve multiple nondominated latency/throughput policies, including
+the original baseline. Use the contract's case grouping, metrics and dominance.
+Do not replace the frontier with a single final working tree or a weighted score.
+
+Write executable policy rules using the supported API. Static parameter sweeps
+may screen ideas but do not establish dynamic policy support. Search P chunking,
+batch selection and waiting, pending KV transmission, and routing where multiple
+instances exist. Unsupported mechanisms are proposals, not scored shortcuts.
+
+## Modification and observation boundary
+
+Only candidate policy source/parameters and search artifacts are writable task
+outputs. Never edit the evaluator, metrics, tests, workload, experiment contract,
+hardware, cost model, tensor work, dependency checks, KV accounting, manifests,
+build dependencies or core implementation. Never change output lengths, omit
+requests, bypass readiness, mark work completed early, or edit reported scores.
+
+Runtime policy uses only its causal observation and bounded per-trial memory.
+No future workload, actual remaining output, result-file access, IO, subprocesses,
+network, wall-clock decisions, unsafe code, core-state access or cross-trial
+memory. Document the frozen length-model limitation; hiding a field does not
+remove idealized memory provisioning. Respect all native action checks.
+
+Do not work around an out-of-scope defect. Record its reproducer and impact;
+mark affected results unavailable. Never commit, stage, push or install a
+candidate into the host project. Do not read credentials or include them in
+artifacts.
+
+## Experiment loop
+
+1. Read the contract/manifest and existing ledger. Verify identities and baseline
+   completion before editing. Reuse only matching, completed evaluations.
+   A resumed invocation has a fresh conversation: reconstruct context from
+   artifacts instead of restarting completed experiments.
+2. Record a falsifiable hypothesis, expected bottleneck, proposed change and
+   matching cases. Freeze the candidate source and parameters before evaluation.
+3. Run syntax/build and focused correctness checks, then complete simulations
+   through the trusted evaluator. Never manufacture a passing record.
+4. Compare identical cases. Record joint SLO pass rate, goodput, latency tails,
+   total throughput, regressions and validity failures. A partial run is not a
+   successful low score. One-token TPOT is unavailable, not zero.
+5. Promote promising candidates through the prescribed case matrix. Retain
+   distinct tradeoffs with their exact code, parameters and reproduction data.
+6. Use bounded diagnostics for winners/failures. Preserve results, metrics,
+   plots and compact causal evidence; collect full graphs only when requested.
+7. Continue while external budgets permit. Supervise child processes; account
+   for exit, OOM, stalls and interruption. Never finish with required work hidden
+   in the background.
+
+Do not inspect holdout inputs. Search-visible validation is not unseen evidence.
+The external verifier alone marks results VERIFIED. Its failures cannot be
+overwritten by agent-authored status. Any renewed tuning from holdout evidence
+requires a new evaluation split/version.
+
+## Stop, resume and report
+
+Stop on an external budget or configured stagnation limit; do not claim global
+optimality. Save frontier references, hypotheses, unresolved issues and exact
+unfinished case IDs. Resume from retained artifacts only after identity checks.
+
+Report tested cases, completed-request counts, SLO thresholds/pass fractions,
+frontier coordinates and policy IDs, gains/retained tradeoffs, regressions,
+failures, model assumptions, verification coverage and actual search cost.
+Distinguish simulated gains from measured hardware performance. No improvement
+is a valid outcome; preserve the baseline and all useful evidence.

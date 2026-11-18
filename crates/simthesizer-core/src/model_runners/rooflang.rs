@@ -303,9 +303,31 @@ impl RooflangRunner {
                     graph.add_edge(read, entry)?;
                     entry = read;
                     if !prefill {
-                        for dependency in graph.kv.read_dependencies(r.request_id, layer, rank) {
-                            if graph.is_pending(dependency) {
-                                graph.add_edge(dependency, read)?;
+                        if graph.kv.controlled() {
+                            if graph.kv.ready_tokens(r.request_id, false, layer, rank) < b.kv_len {
+                                let gate =
+                                    match graph.kv.read_gate(r.request_id, layer, rank, b.kv_len) {
+                                        Some(gate) => gate,
+                                        None => {
+                                            let gate = graph.add_condition();
+                                            graph.kv.register_read_gate(
+                                                r.request_id,
+                                                layer,
+                                                rank,
+                                                b.kv_len,
+                                                gate,
+                                            );
+                                            gate
+                                        }
+                                    };
+                                graph.add_edge(gate, read)?;
+                            }
+                        } else {
+                            for dependency in graph.kv.read_dependencies(r.request_id, layer, rank)
+                            {
+                                if graph.is_pending(dependency) {
+                                    graph.add_edge(dependency, read)?;
+                                }
                             }
                         }
                     }

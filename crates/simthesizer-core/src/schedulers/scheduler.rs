@@ -1,11 +1,21 @@
 use anyhow::Result;
 
 use crate::module::Module;
+use crate::policies::{BatchItem, QueuedRequest};
 use crate::types::{
     InstanceLoad, ParallelStrategy, ReadySubRequest, RequestState, SubRequestCompletion,
 };
 
 pub trait Scheduler: Module {
+    fn policy_queue(&self) -> Result<Option<Vec<QueuedRequest>>> {
+        anyhow::bail!("scheduler does not support policy observations")
+    }
+    fn policy_defaults(&self) -> Result<(u32, usize)> {
+        anyhow::bail!("scheduler does not support policy batches")
+    }
+    fn schedule_batch(&mut self, _items: &[BatchItem]) -> Result<Vec<RequestState>> {
+        anyhow::bail!("scheduler does not support explicit policy batches")
+    }
     fn use_shared_memory(&mut self) -> Result<()> {
         anyhow::bail!("scheduler does not support shared memory admission")
     }

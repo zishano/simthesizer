@@ -1,9 +1,11 @@
 """Shared result loading, DAG timing, and serving metrics. All times are seconds."""
 
 import argparse
+import copy
 import json
 import math
 import statistics
+import tomllib
 from collections import deque
 from dataclasses import dataclass
 from itertools import accumulate
@@ -22,10 +24,16 @@ SCALARS = {
     "output_throughput": "token/s",
     "request_throughput": "request/s",
 }
+TOKEN_RATES = {
+    "tokens_per_user": "token/s/user",
+    "tokens_per_gpu": "token/s/GPU",
+}
 
 
 def metric_unit(metric):
-    return "s/token" if metric == "normalized_e2e" else SCALARS.get(metric, "s")
+    if metric == "normalized_e2e":
+        return "s/token"
+    return TOKEN_RATES.get(metric, SCALARS.get(metric, "s"))
 
 
 def number(value, field):
@@ -134,6 +142,8 @@ class Run:
     label: str
     path: Path
     requests: dict
+    gpu_count: int | None = None
+    service_finish_s: float | None = None
 
     @property
     def origin(self):
@@ -146,6 +156,45 @@ class Run:
                 if node["kind"] == "llm":
                     for elapsed in accumulate(node["token_latency"]):
                         yield starts[index] + elapsed
+
+
+def physical_gpu_count(config):
+    """Count allocated devices, excluding unused topology GPUs; None if unknown."""
+    pending = [config.get("system", {})]
+    allocations = []
+    sharing = False
+    while pending:
+        system = pending.pop()
+        sharing |= bool(system.get("allow_gpu_sharing", False))
+        children = [
+            child
+            for pool in ("instances", "prefill_instances", "decode_instances")
+            for child in system.get(pool, [])
+        ]
+        if children:
+            pending.extend(children)
+        else:
+            allocations.append(system.get("model_runner", {}).get("hardware", {}))
+    ids = [hardware.get("gpu_ids") for hardware in allocations]
+    if all(group is not None for group in ids):
+        devices = set()
+        for hardware, group in zip(allocations, ids):
+            if (
+                not isinstance(group, list)
+                or not group
+                or any(not isinstance(device, str) or not device for device in group)
+                or len(set(group)) != len(group)
+                or hardware.get("gpu_count", len(group)) != len(group)
+            ):
+                return None
+            devices.update(group)
+        return len(devices) or None
+    if any(group is not None for group in ids) or sharing:
+        return None
+    counts = [hardware.get("gpu_count") for hardware in allocations]
+    if counts and all(type(count) is int and count > 0 for count in counts):
+        return sum(counts)
+    return None
 
 
 def load_run(spec):
@@ -169,7 +218,21 @@ def load_run(spec):
                 raise ValueError(f"{path}:{line_number}: {exc}") from exc
     if not requests:
         raise ValueError(f"{path}: empty result")
-    return Run(label, path, dict(sorted(requests.items())))
+    config = path.with_name("config.toml")
+    gpu_count = None
+    if config.is_file():
+        with config.open("rb") as source:
+            gpu_count = physical_gpu_count(tomllib.load(source))
+    stats = path.with_name("policy-stats.json")
+    service_finish = None
+    if stats.is_file():
+        summary = json.loads(stats.read_text())
+        if summary is not None and not isinstance(summary, dict):
+            raise ValueError("policy-stats.json must contain an object or null")
+        service_finish = (summary or {}).get("simulation_end_s")
+        if service_finish is not None:
+            number(service_finish, "simulation_end_s")
+    return Run(label, path, dict(sorted(requests.items())), gpu_count, service_finish)
 
 
 def match_runs(reference, candidate):
@@ -217,8 +280,8 @@ def load_runs(specs):
     return runs
 
 
-def measurements(run):
-    samples = {metric: {} for metric in LATENCIES}
+def measurements(run, service_finish_s=None):
+    samples = {metric: {} for metric in (*LATENCIES, *TOKEN_RATES)}
     finish = run.origin
     output_tokens = 0
     for request_id, row in run.requests.items():
@@ -235,12 +298,25 @@ def measurements(run):
             samples["e2e"][key] = math.fsum(latencies)
             samples["normalized_e2e"][key] = math.fsum(latencies) / len(latencies)
             if len(latencies) > 1:
-                samples["tpot"][key] = statistics.fmean(latencies[1:])
+                tpot = statistics.fmean(latencies[1:])
+                samples["tpot"][key] = tpot
+                if tpot > 0 and math.isfinite(rate := 1 / tpot):
+                    samples["tokens_per_user"][key] = rate
             for token, latency in enumerate(latencies[1:], 1):
                 samples["itl"][(*key, token)] = latency
+    service_finish_s = (
+        run.service_finish_s if service_finish_s is None else service_finish_s
+    )
+    if service_finish_s is not None:
+        number(service_finish_s, "service_finish_s")
+        if service_finish_s + 1e-9 * max(1, finish) < finish:
+            raise ValueError("native service finish precedes observed token completion")
+        finish = max(finish, service_finish_s)
     duration = finish - run.origin
     samples["makespan"] = {(): duration}
     samples["output_throughput"] = {(): output_tokens / duration} if duration else {}
+    if duration and run.gpu_count:
+        samples["tokens_per_gpu"] = {(): output_tokens / duration / run.gpu_count}
     samples["request_throughput"] = (
         {(): len(run.requests) / duration} if duration else {}
     )
@@ -261,6 +337,146 @@ def summarize(samples, percentiles):
     return {
         "mean": statistics.fmean(values) if values else None,
         **{f"p{p:g}": percentile(values, p) if values else None for p in percentiles},
+    }
+
+
+def summarize_run(run, service_finish_s=None):
+    samples = measurements(run, service_finish_s)
+    metrics = {
+        name: {"unit": metric_unit(name), **summarize(values, [50, 95, 99])}
+        for name, values in samples.items()
+    }
+    metrics["tokens_per_user"]["samples"] = len(samples["tokens_per_user"])
+    metrics["tokens_per_gpu"]["gpu_count"] = run.gpu_count
+    return metrics
+
+
+def load_workload(path):
+    """Validate an input trace without inventing any execution timing."""
+    rows = []
+    seen = set()
+    with Path(path).open() as source:
+        for index, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            checked = copy.deepcopy(row)
+            for node in checked.get("sub_requests", []):
+                if node.get("kind") == "llm":
+                    count = integer(node.get("output_tokens"), "output_tokens")
+                    node["token_latency"] = [0.0] * count
+            try:
+                parse_request(checked)
+                if row["request_id"] in seen:
+                    raise ValueError("duplicate request_id")
+            except (ValueError, TypeError, KeyError) as error:
+                raise ValueError(f"{path}:{index}: {error}") from error
+            seen.add(row["request_id"])
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"{path}: empty workload")
+    return rows
+
+
+def validate_complete(run, workload):
+    """Match every result against its immutable input, including zero-output work."""
+    expected = {row["request_id"]: row for row in workload}
+    if len(expected) != len(workload) or expected.keys() != run.requests.keys():
+        raise ValueError("result request IDs do not exactly match the workload")
+    outputs = 0
+    for identity, row in expected.items():
+        result = run.requests[identity]
+        if (
+            row["arrival_time"] != result["arrival_time"]
+            or sorted(row["initial"]) != result["initial"]
+        ):
+            raise ValueError(f"request {identity}: arrival/initial differs")
+        if len(row["sub_requests"]) != len(result["sub_requests"]):
+            raise ValueError(f"request {identity}: sub-request count differs")
+        for index, (source, actual) in enumerate(
+            zip(row["sub_requests"], result["sub_requests"])
+        ):
+            fields = ("kind", "input_tokens", "output_tokens", "model", "duration")
+            if any(source.get(key) != actual.get(key) for key in fields):
+                raise ValueError(f"request {identity}/{index}: task content differs")
+            if (
+                sorted(source["next"]) != actual["next"]
+                or (source.get("interval") or 0) != actual["interval"]
+            ):
+                raise ValueError(
+                    f"request {identity}/{index}: dependency/interval differs"
+                )
+            if source["kind"] == "llm":
+                outputs += source["output_tokens"]
+                # Native results omit token IDs. When present, they must agree;
+                # the evaluator separately hashes the entire input, including IDs.
+                for key in ("input_token_ids", "output_token_ids"):
+                    if key in actual and actual[key] != source.get(key):
+                        raise ValueError(f"request {identity}/{index}: {key} differs")
+    return {
+        "expected_requests": len(workload),
+        "completed_requests": len(run.requests),
+        "output_tokens": outputs,
+    }
+
+
+def slo_metrics(run, slo, service_finish_s=None):
+    """Joint per-request SLO goodput for the single-LLM policy-search contract."""
+    limits = [slo["ttft_limit_s"], slo["tpot_limit_s"]]
+    fraction = slo["min_joint_pass_fraction"]
+    if any(
+        type(x) not in (int, float) or not math.isfinite(x) or x <= 0 for x in limits
+    ):
+        raise ValueError("SLO latency limits must be finite and positive")
+    if (
+        type(fraction) not in (int, float)
+        or not math.isfinite(fraction)
+        or not 0 < fraction <= 1
+    ):
+        raise ValueError("SLO pass fraction must be in (0, 1]")
+    eligible = passed = passed_tokens = excluded = single_token = 0
+    for row in run.requests.values():
+        if len(row["sub_requests"]) != 1 or row["sub_requests"][0]["kind"] != "llm":
+            raise ValueError("policy-search SLO scoring requires one LLM per request")
+        tokens = row["sub_requests"][0]["token_latency"]
+        if not tokens:
+            excluded += 1
+            continue
+        eligible += 1
+        single_token += len(tokens) == 1
+        if tokens[0] <= limits[0] and (
+            len(tokens) == 1 or statistics.fmean(tokens[1:]) <= limits[1]
+        ):
+            passed += 1
+            passed_tokens += len(tokens)
+    service_finish_s = (
+        run.service_finish_s if service_finish_s is None else service_finish_s
+    )
+    if excluded and service_finish_s is None:
+        raise ValueError(
+            "zero-output requests require the native service completion time"
+        )
+    duration = measurements(run, service_finish_s)["makespan"][()]
+    available = eligible > 0 and duration > 0 and bool(run.gpu_count)
+    achieved = passed / eligible if eligible else None
+    goodput = passed_tokens / duration if available else None
+    if goodput is not None and not math.isfinite(goodput):
+        available, goodput = False, None
+    return {
+        "limits": dict(slo),
+        "eligible_requests": eligible,
+        "passed_requests": passed,
+        "excluded_zero_output_requests": excluded,
+        "single_output_requests": single_token,
+        "joint_pass_fraction": achieved,
+        "passed_output_tokens": passed_tokens,
+        "duration_s": duration,
+        "gpu_count": run.gpu_count,
+        "available": available,
+        "goodput": goodput,
+        "goodput_per_gpu": goodput / run.gpu_count if available else None,
+        "feasible": bool(available and achieved >= fraction),
+        "tpot_applicable": eligible > single_token,
     }
 
 
@@ -316,8 +532,13 @@ def percent(value):
 
 
 def protect_output(path, runs):
-    if path.resolve() in {run.path.resolve() for run in runs}:
-        raise ValueError("output must not overwrite an input result")
+    inputs = {
+        source.resolve()
+        for run in runs
+        for source in (run.path, run.path.with_name("config.toml"))
+    }
+    if path.resolve() in inputs:
+        raise ValueError("output must not overwrite an input result or config")
 
 
 def table(headers, rows):

@@ -8,6 +8,107 @@ use simthesizer_core::network_sims::flow::FlowNetworkSimulator;
 use simthesizer_core::types::{ComputeContext, NodeID, PollResult};
 use simthesizer_core::{Engine, Graph, LogicalHandler, Module, NetworkSimulator};
 
+#[derive(Default)]
+struct SummarySystem {
+    results: Vec<simthesizer_core::types::RequestResult>,
+}
+
+enum SummaryEvent {
+    Work,
+    Complete {
+        request_id: u64,
+        arrival: f64,
+        output_tokens: u32,
+    },
+}
+
+impl Module for SummarySystem {}
+impl LogicalHandler for SummarySystem {
+    fn handle(&mut self, payload: Box<dyn Any>, now: f64, _: NodeID, _: &mut Graph) -> Result<f64> {
+        match *payload.downcast::<SummaryEvent>().unwrap() {
+            SummaryEvent::Work => Ok(0.25),
+            SummaryEvent::Complete {
+                request_id,
+                arrival,
+                output_tokens,
+            } => {
+                self.results.push(simthesizer_core::types::RequestResult {
+                    request_id,
+                    arrival_time: arrival,
+                    initial: vec![0],
+                    sub_requests: vec![simthesizer_core::types::ResultSubRequest::Llm {
+                        input_tokens: 4,
+                        output_tokens,
+                        next: vec![],
+                        token_latency: if output_tokens > 0 {
+                            vec![now - arrival]
+                        } else {
+                            vec![]
+                        },
+                        interval: None,
+                        model: None,
+                    }],
+                });
+                Ok(0.0)
+            }
+        }
+    }
+}
+impl simthesizer_core::System for SummarySystem {
+    fn policy_statistics(&self) -> Option<simthesizer_core::policies::PolicyStatistics> {
+        Some(Default::default())
+    }
+    fn init(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn instance_load(&self) -> simthesizer_core::types::InstanceLoad {
+        Default::default()
+    }
+    fn add_request_arrival(
+        &mut self,
+        _: simthesizer_core::types::Request,
+        _: &mut Graph,
+        _: Option<NodeID>,
+        _: Option<*mut dyn LogicalHandler>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+    fn into_results(self: Box<Self>) -> Result<Vec<simthesizer_core::types::RequestResult>> {
+        Ok(self.results)
+    }
+}
+
+#[test]
+fn policy_summary_includes_final_zero_output_work_completion() {
+    let mut owner = Box::<SummarySystem>::default();
+    let handler = &mut *owner as *mut dyn LogicalHandler;
+    let mut graph = Graph::new();
+    for (request_id, arrival, output_tokens) in [(0, 0.0, 1), (1, 1.0, 0)] {
+        let work = graph.add_logical_node_at(handler, SummaryEvent::Work, arrival);
+        let complete = graph.add_logical_node(
+            handler,
+            SummaryEvent::Complete {
+                request_id,
+                arrival,
+                output_tokens,
+            },
+        );
+        graph.add_edge(work, complete).unwrap();
+    }
+    let (results, statistics) = Engine::new(graph, owner)
+        .run_with_summary(|_, _| Ok(()))
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let simthesizer_core::types::ResultSubRequest::Llm { token_latency, .. } =
+        &results[1].sub_requests[0]
+    else {
+        unreachable!()
+    };
+    assert!(token_latency.is_empty());
+    assert_eq!(results[1].arrival_time, 1.0);
+    assert_eq!(statistics.unwrap().simulation_end_s, Some(1.25));
+}
+
 #[test]
 fn fork_join_waits_for_all_parents_and_the_childs_release_time() {
     let mut owner = Box::<Recorder>::default();
@@ -107,6 +208,49 @@ fn cycles_and_missing_node_ids_fail() {
     graph.add_edge(a, b).unwrap();
     graph.add_edge(b, a).unwrap();
     assert!(Engine::new(graph, owner).run().is_err());
+}
+
+struct ReleaseCondition(NodeID);
+impl Module for ReleaseCondition {}
+impl LogicalHandler for ReleaseCondition {
+    fn handle(
+        &mut self,
+        _: Box<dyn Any>,
+        _: f64,
+        current: NodeID,
+        graph: &mut Graph,
+    ) -> Result<f64> {
+        graph.release_condition(self.0, current)?;
+        Ok(0.0)
+    }
+}
+
+#[test]
+fn held_condition_waits_for_causal_release_without_added_latency() {
+    let mut owner = Box::<Recorder>::default();
+    let events = owner.events.clone();
+    let mut graph = Graph::new();
+    let gate = graph.add_condition();
+    let child = graph.add_logical_node(
+        &mut *owner as *mut dyn LogicalHandler,
+        ("read".to_string(), 0.0),
+    );
+    graph.add_edge(gate, child).unwrap();
+    let mut release = Box::new(ReleaseCondition(gate));
+    graph.add_logical_node_at(&mut *release as *mut dyn LogicalHandler, (), 3.0);
+    Engine::new(graph, owner).run().unwrap();
+    assert_eq!(*events.borrow(), vec![("read".to_string(), 3.0)]);
+}
+
+#[test]
+fn unreleased_condition_fails_drain_instead_of_running() {
+    let mut graph = Graph::new();
+    graph.add_condition();
+    assert!(Engine::new(graph, Box::<Recorder>::default())
+        .run()
+        .unwrap_err()
+        .to_string()
+        .contains("blocked nodes"));
 }
 
 #[test]

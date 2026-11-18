@@ -11,7 +11,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
-from results import load_run, measurements, metric_unit, summarize
+from results import load_run, summarize_run
 from rooflang_bridge.configuration import pd_config, toml_document, topology_pd_config
 from rooflang_bridge.pd_report import export_transfers
 
@@ -350,11 +350,7 @@ def main():
     run(command, output / "simulation.log")
     wall = time.perf_counter() - started
     print("请求仿真完成，正在汇总指标……", flush=True)
-    samples = measurements(load_run(str(output / "result.jsonl")))
-    metrics = {
-        name: {"unit": metric_unit(name), **summarize(values, [50, 95, 99])}
-        for name, values in samples.items()
-    }
+    metrics = summarize_run(load_run(str(output / "result.jsonl")))
     (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     (output / "execution.json").write_text(
         json.dumps(
@@ -377,6 +373,10 @@ def main():
         )
 
     script("draw.py", output / "result.jsonl", "--output", output / "metrics.png")
+    script(
+        "draw_throughput.py", output / "result.jsonl", "--output", output / "throughput.png",
+        "--title", "P/D service throughput" if args.pd else "Service throughput",
+    )
     if not reports:
         if reference:
             script(
@@ -387,7 +387,7 @@ def main():
                 output / "comparison.json",
             )
         print(
-            f"\n完成。指标图：{output / 'metrics.png'}\n指标：{output / 'metrics.json'}\n逐 token 结果：{output / 'result.jsonl'}",
+            f"\n完成。指标图：{output / 'metrics.png'}\n吞吐关系图：{output / 'throughput.png'}\n指标：{output / 'metrics.json'}\n逐 token 结果：{output / 'result.jsonl'}",
             flush=True,
         )
         return
@@ -484,6 +484,7 @@ def main():
     links = [
         ("result.jsonl", "逐 token 时间（秒）"),
         ("metrics.json", "指标汇总"),
+        ("throughput.png", "整体服务吞吐：tokens/s/user × tokens/s/GPU"),
         ("outer.jsonl", "外层图原始事件"),
         ("state.jsonl", "系统状态"),
         ("execution.json", "命令现实耗时"),

@@ -6,11 +6,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from compare import compare
+from draw_throughput import draw as draw_throughput
 from results import (
     Run,
     load_run,
@@ -19,8 +21,10 @@ from results import (
     measurements,
     paired_errors,
     parse_request,
+    physical_gpu_count,
     relative_error,
     summarize,
+    summarize_run,
     throughput,
     timeline,
 )
@@ -73,6 +77,28 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(result["makespan"], {(): 9})
         self.assertEqual(result["output_throughput"], {(): 6 / 9})
         self.assertEqual(result["request_throughput"], {(): 3 / 9})
+        self.assertEqual(result["tokens_per_user"], {(0, 0): 0.4, (1, 0): 0.2})
+        self.assertAlmostEqual(summarize(result["tokens_per_user"], [50])["mean"], 0.3)
+        self.assertEqual(result["tokens_per_gpu"], {})
+
+    def test_gpu_rate_includes_arrival_gaps_and_undefined_user_rates(self):
+        result = run(
+            request([llm([1, 0, 0])], arrival=10),
+            request([llm([1])], request_id=1, arrival=17),
+        )
+        result.gpu_count = 4
+        metrics = summarize_run(result)
+        # Four output tokens over eight seconds on four GPUs.
+        self.assertEqual(metrics["tokens_per_gpu"]["mean"], 0.125)
+        self.assertEqual(metrics["tokens_per_gpu"]["gpu_count"], 4)
+        self.assertEqual(metrics["tokens_per_gpu"]["unit"], "token/s/GPU")
+        self.assertIsNone(metrics["tokens_per_user"]["mean"])
+        self.assertEqual(metrics["tokens_per_user"]["samples"], 0)
+        result = run(request([llm([0, 0])]))
+        result.gpu_count = 4
+        metrics = summarize_run(result)
+        self.assertIsNone(metrics["tokens_per_gpu"]["mean"])
+        json.dumps(metrics, allow_nan=False)
 
     def test_dag_intervals_fork_join_and_tool_tail(self):
         tool = {
@@ -187,6 +213,63 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(rates, [2, 1, 1, 0, 0])
         self.assertEqual(sum(rates), 4)
         self.assertEqual(measurements(result)["makespan"], {(): 2.5})
+
+
+class GpuAllocationTests(unittest.TestCase):
+    def test_allocated_ids_are_deduplicated_across_pd_pools(self):
+        config = {
+            "system": {
+                "tp": 1,
+                "prefill_instances": [
+                    {
+                        "model_runner": {
+                            "hardware": {
+                                "gpu_count": 2,
+                                "gpu_ids": ["g0", "g1"],
+                                "topology": {"gpu_count": 8},
+                            }
+                        }
+                    }
+                ],
+                "decode_instances": [
+                    {
+                        "model_runner": {
+                            "hardware": {
+                                "gpu_count": 2,
+                                "gpu_ids": ["g2", "g3"],
+                            }
+                        }
+                    }
+                ],
+            }
+        }
+        self.assertEqual(physical_gpu_count(config), 4)
+        config["system"]["allow_gpu_sharing"] = True
+        config["system"]["decode_instances"][0]["model_runner"]["hardware"][
+            "gpu_ids"
+        ] = ["g1", "g2"]
+        self.assertEqual(physical_gpu_count(config), 3)
+
+    def test_legacy_counts_and_unknown_allocations(self):
+        leaf = {"model_runner": {"hardware": {"gpu_count": 2}}}
+        self.assertEqual(physical_gpu_count({"system": leaf}), 2)
+        config = {"system": {"prefill_instances": [leaf], "decode_instances": [leaf]}}
+        self.assertEqual(physical_gpu_count(config), 4)
+        self.assertIsNone(physical_gpu_count({"system": {"model_runner": {"tp": 2}}}))
+        config["system"]["allow_gpu_sharing"] = True
+        self.assertIsNone(physical_gpu_count(config))
+        config["system"]["allow_gpu_sharing"] = False
+        config["system"]["decode_instances"] = [
+            {
+                "model_runner": {
+                    "hardware": {
+                        "gpu_count": 2,
+                        "gpu_ids": ["g0", "g1"],
+                    }
+                }
+            }
+        ]
+        self.assertIsNone(physical_gpu_count(config))
 
 
 class ValidationTests(unittest.TestCase):
@@ -334,6 +417,106 @@ class CliTests(unittest.TestCase):
         svg = (self.root / "cdf.svg").read_text()
         self.assertIn("Time since first arrival", svg)
         self.assertIn("TTFT", svg)
+
+    def test_summary_and_separate_throughput_plot(self):
+        (self.root / "config.toml").write_text(
+            "[[system.prefill_instances]]\n"
+            "[system.prefill_instances.model_runner.hardware]\n"
+            'gpu_count = 2\ngpu_ids = ["g0", "g1"]\n'
+            "[[system.decode_instances]]\n"
+            "[system.decode_instances.model_runner.hardware]\n"
+            'gpu_count = 2\ngpu_ids = ["g2", "g3"]\n'
+        )
+        output = self.root / "metrics.svg"
+        summary = self.root / "metrics.json"
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/draw.py"),
+                str(self.reference),
+                "--output",
+                str(output),
+                "--metrics-json",
+                str(summary),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        metrics = json.loads(summary.read_text())
+        self.assertEqual(metrics["tokens_per_user"]["mean"], 0.4)
+        self.assertEqual(metrics["tokens_per_user"]["samples"], 1)
+        self.assertEqual(metrics["tokens_per_gpu"]["mean"], 0.125)
+        self.assertEqual(metrics["tokens_per_gpu"]["gpu_count"], 4)
+        svg = output.read_text()
+        for label in ("TTFT", "Output throughput"):
+            self.assertIn(label, svg)
+        self.assertNotIn("Tokens/s/user", svg)
+        self.assertNotIn("Tokens/s/GPU", svg)
+        self.candidate.write_text(
+            json.dumps(request([llm([2, 4, 6])], arrival=7)) + "\n"
+        )
+        xy = self.root / "throughput.svg"
+        process = self.command("draw_throughput.py", "--output", xy)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        svg = xy.read_text()
+        for label in ("Tokens/s/user", "Tokens/s/GPU", "4 GPUs", "excluding TTFT"):
+            self.assertIn(label, svg)
+        self.assertNotIn("CDF", svg)
+        self.assertNotIn("Time since first arrival", svg)
+
+    def test_throughput_has_one_point_per_deployment(self):
+        from matplotlib.collections import PathCollection
+
+        first = run(request(), request([llm([4, 5])], request_id=1), label="first")
+        second = run(
+            request([llm([2, 4, 6])]),
+            request([llm([8, 10])], request_id=1),
+            label="second",
+        )
+        first.gpu_count = second.gpu_count = 4
+        with patch("matplotlib.figure.Figure.savefig", autospec=True) as save:
+            draw_throughput([first, second], self.root / "throughput.png")
+        figure = save.call_args.args[0]
+        self.assertEqual(len(figure.axes), 1)
+        ax = figure.axes[0]
+        points = [
+            item.get_offsets()
+            for item in ax.collections
+            if isinstance(item, PathCollection)
+        ]
+        self.assertEqual([len(point) for point in points], [1, 1])
+        for actual, expected in zip(points, [(0.3, 5 / 36), (0.15, 5 / 72)]):
+            self.assertAlmostEqual(actual[0][0], expected[0])
+            self.assertAlmostEqual(actual[0][1], expected[1])
+        self.assertEqual(ax.get_xlabel(), "Tokens/s/user")
+        self.assertEqual(ax.get_ylabel(), "Tokens/s/GPU")
+
+    def test_throughput_leaves_undefined_rates_unplotted(self):
+        output = self.root / "throughput.svg"
+        for known_gpu in (False, True):
+            if known_gpu:
+                (self.root / "config.toml").write_text(
+                    "[system.model_runner.hardware]\ngpu_count = 4\n"
+                )
+                self.reference.write_text(json.dumps(request([llm([1, 0, 0])])) + "\n")
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/draw_throughput.py"),
+                    str(self.reference),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            svg = output.read_text()
+            self.assertIn("No eligible deployment point", svg)
+            self.assertNotIn("PathCollection", svg)
 
 
 if __name__ == "__main__":

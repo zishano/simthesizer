@@ -9,6 +9,7 @@ use crate::engine::Graph;
 use crate::model::Model;
 use crate::model_runner::ModelRunner;
 use crate::module::{LogicalHandler, Module};
+use crate::policies::{BatchAction, BatchObservation, InstanceId, SharedPolicy};
 use crate::scheduler::Scheduler;
 use crate::system::{pending_llm_load, System, SystemEvent};
 use crate::types::{
@@ -37,6 +38,12 @@ pub struct SingleInstanceSystem {
 
     #[serde(skip_deserializing, default)]
     pending_completion_results: HashMap<NodeID, SubRequestCompletion>,
+
+    #[serde(skip)]
+    policy: Option<(SharedPolicy, InstanceId)>,
+
+    #[serde(skip)]
+    policy_wakeup: Option<NodeID>,
 }
 
 struct ActiveRequest {
@@ -80,6 +87,7 @@ enum LogicalPayload {
         completion_node_id: NodeID,
     },
     LlmSchedule,
+    PolicyWake,
     LlmBatchComplete,
     ToolCallRun {
         duration: f64,
@@ -381,7 +389,48 @@ impl LogicalHandler for SingleInstanceSystem {
                 Ok(0.0)
             }
             LogicalPayload::LlmSchedule => {
-                let batch_requests = self.scheduler.schedule()?;
+                if self.policy_wakeup.is_some() {
+                    return Ok(0.0);
+                }
+                let batch_requests = if let Some((policy, instance)) = &self.policy {
+                    if policy.borrow().is_reference() {
+                        let batch = self.scheduler.schedule()?;
+                        if !batch.is_empty() {
+                            policy.borrow_mut().record_reference_batch();
+                        }
+                        batch
+                    } else {
+                        let Some(requests) = self.scheduler.policy_queue()? else {
+                            return Ok(0.0);
+                        };
+                        let (default_token_budget, default_max_batch) =
+                            self.scheduler.policy_defaults()?;
+                        let observation = BatchObservation {
+                            now,
+                            instance: *instance,
+                            requests: &requests,
+                            default_token_budget,
+                            default_max_batch,
+                            memory_limit_bytes: self.scheduler.memory_limit(),
+                        };
+                        let action = policy.borrow_mut().batch(&observation)?;
+                        match action {
+                            BatchAction::Run(plan) => self.scheduler.schedule_batch(&plan.items)?,
+                            BatchAction::Wait { until } => {
+                                let wake = graph.add_logical_node_at(
+                                    module,
+                                    LogicalPayload::PolicyWake,
+                                    until,
+                                );
+                                graph.add_edge(current, wake)?;
+                                self.policy_wakeup = Some(wake);
+                                return Ok(0.0);
+                            }
+                        }
+                    }
+                } else {
+                    self.scheduler.schedule()?
+                };
                 if batch_requests.is_empty() {
                     return Ok(0.0);
                 }
@@ -396,6 +445,16 @@ impl LogicalHandler for SingleInstanceSystem {
                 let complete = graph.add_logical_node(module, LogicalPayload::LlmBatchComplete);
                 graph.add_edge(last_node, complete)?;
 
+                Ok(0.0)
+            }
+            LogicalPayload::PolicyWake => {
+                anyhow::ensure!(
+                    self.policy_wakeup == Some(current),
+                    "unexpected policy wakeup"
+                );
+                self.policy_wakeup = None;
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
+                graph.add_edge(current, schedule)?;
                 Ok(0.0)
             }
             LogicalPayload::LlmBatchComplete => {
@@ -428,6 +487,19 @@ impl Module for SingleInstanceSystem {
 }
 
 impl System for SingleInstanceSystem {
+    fn configure_policy(&mut self, policy: SharedPolicy, instance: InstanceId) -> Result<()> {
+        anyhow::ensure!(
+            self.model_runner.shared_execution(),
+            "serving policy requires shared execution"
+        );
+        anyhow::ensure!(
+            self.policy.is_none(),
+            "policy already configured for instance"
+        );
+        self.policy = Some((policy, instance));
+        Ok(())
+    }
+
     fn shared_execution(&self) -> bool {
         self.model_runner.shared_execution()
     }
@@ -567,5 +639,183 @@ impl System for SingleInstanceSystem {
             );
         }
         Ok(self.results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policies::{reference_batch, test_config, PolicyRuntime, Stage};
+    use crate::schedulers::chunked_prefill::ChunkedPrefillScheduler;
+    use crate::types::{Layer, ParallelStrategy, RequestState};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct FixedModel;
+    impl Module for FixedModel {}
+    impl Model for FixedModel {
+        fn init(&mut self, _: ParallelStrategy) -> Result<()> {
+            Ok(())
+        }
+        fn weight_bytes_per_device(&self) -> u64 {
+            0
+        }
+        fn kv_bytes_per_token_per_device(&self) -> u64 {
+            1
+        }
+        fn pre_block_layers(&self) -> &[Layer] {
+            &[]
+        }
+        fn block_layers(&self) -> &[Layer] {
+            &[]
+        }
+        fn post_block_layers(&self) -> &[Layer] {
+            &[]
+        }
+        fn num_blocks(&self) -> u32 {
+            0
+        }
+    }
+
+    struct FixedRunner {
+        starts: Rc<RefCell<Vec<(f64, Vec<u64>)>>>,
+    }
+    impl Module for FixedRunner {}
+    impl LogicalHandler for FixedRunner {
+        fn handle(
+            &mut self,
+            payload: Box<dyn Any>,
+            now: f64,
+            _: NodeID,
+            _: &mut Graph,
+        ) -> Result<f64> {
+            self.starts
+                .borrow_mut()
+                .push((now, *payload.downcast::<Vec<u64>>().unwrap()));
+            Ok(0.25)
+        }
+    }
+    impl ModelRunner for FixedRunner {
+        fn shared_execution(&self) -> bool {
+            true
+        }
+        fn parallel_strategy(&self) -> ParallelStrategy {
+            ParallelStrategy {
+                tp: 1,
+                pp: 1,
+                ep: 1,
+            }
+        }
+        fn add_iteration(
+            &mut self,
+            _: &dyn Model,
+            _: &[RequestState],
+            _: NodeID,
+            _: &mut Graph,
+        ) -> Result<NodeID> {
+            bail!("fixture requires explicit request identities")
+        }
+        fn add_scheduled_iteration(
+            &mut self,
+            _: &dyn Model,
+            _: &[RequestState],
+            requests: &[crate::kv::BatchRequest],
+            current: NodeID,
+            graph: &mut Graph,
+        ) -> Result<NodeID> {
+            let node = graph.add_logical_node(
+                self as *mut dyn LogicalHandler,
+                requests.iter().map(|r| r.request_id).collect::<Vec<_>>(),
+            );
+            graph.add_edge(current, node)?;
+            Ok(node)
+        }
+    }
+
+    fn request(id: u64, arrival_time: f64) -> Request {
+        Request {
+            request_id: id,
+            arrival_time,
+            initial: vec![0],
+            sub_requests: vec![SubRequest::Llm {
+                input_tokens: 4,
+                output_tokens: 1,
+                known_tokens: None,
+                kv_tokens: None,
+                next: vec![],
+                interval: None,
+                model: None,
+                input_token_ids: None,
+                output_token_ids: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn policy_wait_wakes_without_arrivals_and_arrivals_cannot_bypass_it() {
+        for second_arrival in [None, Some(0.25)] {
+            let starts = Rc::new(RefCell::new(Vec::new()));
+            let scheduler: ChunkedPrefillScheduler = toml::from_str("block_size=4\nmax_batch=4\nmax_num_batched_tokens=8\ndevice_mem=1024\ndevice_mem_utilization=1.0\nenable_prefix_caching=false").unwrap();
+            let mut system = Box::new(SingleInstanceSystem {
+                model: Box::new(FixedModel),
+                model_runner: Box::new(FixedRunner {
+                    starts: starts.clone(),
+                }),
+                scheduler: Box::new(scheduler),
+                results: Vec::new(),
+                pending_requests: HashMap::new(),
+                request_sinks: HashMap::new(),
+                active_requests: HashMap::new(),
+                pending_completion_results: HashMap::new(),
+                policy: None,
+                policy_wakeup: None,
+            });
+            let mut runtime = PolicyRuntime::new(test_config()).unwrap();
+            runtime.set_batch_for_test(|observation, context, memory| {
+                if memory[0] == 0 {
+                    memory[0] = 1;
+                    BatchAction::Wait {
+                        until: observation.now + 0.5,
+                    }
+                } else {
+                    reference_batch(observation, context, memory)
+                }
+            });
+            let policy = Rc::new(RefCell::new(runtime));
+            system
+                .configure_policy(
+                    policy.clone(),
+                    InstanceId {
+                        stage: Stage::Prefill,
+                        index: 0,
+                    },
+                )
+                .unwrap();
+            system.init().unwrap();
+            let mut graph = Graph::new();
+            system
+                .add_request_arrival(request(0, 0.0), &mut graph, None, None)
+                .unwrap();
+            if let Some(at) = second_arrival {
+                system
+                    .add_request_arrival(request(1, at), &mut graph, None, None)
+                    .unwrap();
+            }
+            let results = crate::Engine::new(graph, system).run().unwrap();
+            assert_eq!(starts.borrow().len(), 1);
+            assert_eq!(starts.borrow()[0].0, 0.5);
+            assert_eq!(
+                starts.borrow()[0].1.len(),
+                if second_arrival.is_some() { 2 } else { 1 }
+            );
+            for result in results {
+                let ResultSubRequest::Llm { token_latency, .. } = &result.sub_requests[0] else {
+                    unreachable!()
+                };
+                assert_eq!(token_latency, &vec![0.75 - result.arrival_time]);
+            }
+            assert_eq!(policy.borrow().statistics().waits, 1);
+            assert_eq!(policy.borrow().statistics().batch_decisions, 2);
+        }
     }
 }

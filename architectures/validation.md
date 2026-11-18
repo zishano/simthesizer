@@ -98,12 +98,34 @@ For an LLM call with latency array `L` and `N = len(L)`:
 | `makespan` | Last DAG completion minus first request arrival | One per run |
 | `output_throughput` | All LLM output tokens divided by makespan | One per run |
 | `request_throughput` | Completed request DAGs divided by makespan | One per run |
+| `tokens_per_user` | `(N - 1) / sum(L[1:])`; excludes TTFT | One per LLM call with at least two tokens and finite positive rate |
+| `tokens_per_gpu` | `output_throughput / allocated physical GPU count` | One per run with known GPU allocation |
 
 TTFT and LLM E2E start when the call becomes ready after its interval. TPOT
 weights calls equally; ITL weights token intervals equally. Zero-output calls
 have no latency samples and contribute no execution time to reconstructed DAGs.
 Throughput includes arrival gaps, tool time, and drain time; it measures this
 finite workload, not saturation capacity. Zero-duration runs have undefined rates.
+
+For `tokens_per_user`, a user means one LLM call, not an account spanning calls.
+Rates are computed before averaging; reciprocal mean TPOT is a different quantity.
+GPU allocation comes from `config.toml` beside the result. Explicit runner GPU IDs
+are deduplicated across P/D and instances; unused topology devices are excluded.
+Independent legacy allocations without IDs use summed hardware `gpu_count`.
+Missing or ambiguous GPU metadata leaves the rate undefined. Inspection summaries
+include eligible user sample count and the GPU denominator. `metrics.png` retains
+the six latency/time-series panels. A separate `throughput.png` plots one point
+per run: X is mean `tokens_per_user`, Y is whole-run `tokens_per_gpu`. These are
+deployment summaries, not individual request points. Multiple completed runs can
+be plotted together, including different arrival rates; no curve is inferred from
+a single run. The GPU mean uses makespan, not padded throughput bins.
+
+Refresh a saved run without simulation:
+
+```sh
+python scripts/draw.py RUN/result.jsonl --output RUN/metrics.png --metrics-json RUN/metrics.json
+python scripts/draw_throughput.py RUN/result.jsonl --output RUN/throughput.png
+```
 
 For each latency metric, report the reference and prediction's mean and selected
 percentiles, plus signed relative error `100 * (prediction - reference) / reference`.

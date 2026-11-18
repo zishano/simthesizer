@@ -1,6 +1,7 @@
 """Plot complete serving results. The first run is the scatter reference."""
 
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from results import (
     metric_unit,
     positive_float,
     protect_output,
+    summarize_run,
     throughput,
 )
 
@@ -20,6 +22,7 @@ def draw(runs, output, metrics, view, window, title, columns, size):
 
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 
     samples = [measurements(run) for run in runs]
     end = max(sample["makespan"][()] for sample in samples)
@@ -36,6 +39,7 @@ def draw(runs, output, metrics, view, window, title, columns, size):
     for ax, metric in zip(axes.flat, metrics):
         ax.grid(True, alpha=0.2)
         ax.set_axisbelow(True)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
         if metric == "throughput":
             for i, run in enumerate(runs):
                 edges, values = throughput(run, window, end)
@@ -50,7 +54,7 @@ def draw(runs, output, metrics, view, window, title, columns, size):
                 title=f"Output throughput ({window:g} s bins)",
                 xlabel="Time since first arrival (s)",
                 ylabel="Output tokens / s",
-                xlim=(0, edges[-1]),
+                xlim=(0, (math.floor(end / window) + 1) * window),
                 ylim=(0, None),
             )
         elif metric == "cumulative":
@@ -118,7 +122,11 @@ def draw(runs, output, metrics, view, window, title, columns, size):
             ax.legend(handles, labels, fontsize="small", frameon=False)
         else:
             ax.text(
-                0.5, 0.5, "No eligible samples", ha="center", transform=ax.transAxes
+                0.5,
+                0.5,
+                "No eligible samples",
+                ha="center",
+                transform=ax.transAxes,
             )
     for ax in list(axes.flat)[len(metrics) :]:
         ax.remove()
@@ -140,10 +148,20 @@ def main():
         "--output", type=Path, required=True, help="PNG, SVG, or PDF path"
     )
     parser.add_argument(
+        "--metrics-json", type=Path, help="also refresh metric summaries (one run only)"
+    )
+    parser.add_argument(
         "--metrics",
         nargs="+",
         choices=[*LATENCIES, "throughput", "cumulative"],
-        default=["ttft", "tpot", "itl", "e2e", "request_e2e", "throughput"],
+        default=[
+            "ttft",
+            "tpot",
+            "itl",
+            "e2e",
+            "request_e2e",
+            "throughput",
+        ],
     )
     parser.add_argument(
         "--view",
@@ -174,6 +192,12 @@ def main():
         if args.view == "scatter" and len(runs) < 2:
             raise ValueError("scatter requires a reference and at least one candidate")
         protect_output(args.output, runs)
+        if args.metrics_json:
+            if len(runs) != 1:
+                raise ValueError("--metrics-json requires exactly one run")
+            protect_output(args.metrics_json, runs)
+            if args.metrics_json.resolve() == args.output.resolve():
+                raise ValueError("metrics JSON and figure must use different paths")
         draw(
             runs,
             args.output,
@@ -184,6 +208,11 @@ def main():
             args.columns,
             args.size,
         )
+        if args.metrics_json:
+            args.metrics_json.parent.mkdir(parents=True, exist_ok=True)
+            args.metrics_json.write_text(
+                json.dumps(summarize_run(runs[0]), indent=2, allow_nan=False) + "\n"
+            )
         print(args.output)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"error: {exc}\n")

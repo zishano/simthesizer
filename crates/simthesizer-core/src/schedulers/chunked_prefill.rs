@@ -1,9 +1,10 @@
-use std::collections::{HashSet, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 
 use crate::module::Module;
+use crate::policies::{BatchItem, QueuedRequest};
 use crate::scheduler::Scheduler;
 use crate::schedulers::prefix_cache::{hash_block, PrefixCache};
 use crate::types::{
@@ -29,7 +30,10 @@ pub struct ChunkedPrefillScheduler {
     running: bool,
 
     #[serde(skip_deserializing, default)]
-    current_batch: Vec<RequestState>,
+    current_batch: Vec<ScheduledRequest>,
+
+    #[serde(skip)]
+    arbitrary_batch: bool,
 
     #[serde(skip_deserializing, default)]
     admitted: HashSet<NodeID>,
@@ -91,11 +95,51 @@ struct RunningRequest {
     block_hashes: Vec<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct ScheduledRequest {
+    completion_node_id: NodeID,
+    state: RequestState,
+    metadata: crate::kv::BatchRequest,
+}
+
 fn block_count(num_tokens: u32, block_size: u32) -> u32 {
     num_tokens.div_ceil(block_size)
 }
 
 impl RunningRequest {
+    fn scheduled(&self, q_len: u32) -> ScheduledRequest {
+        ScheduledRequest {
+            completion_node_id: self.completion_node_id,
+            state: RequestState {
+                q_len,
+                kv_len: self.effective_kv_tokens(),
+                lm_head_len: 1,
+            },
+            metadata: crate::kv::BatchRequest {
+                request_id: self.request_id,
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+            },
+        }
+    }
+
+    fn commit(&mut self, scheduled: RequestState, now: f64, generation_tokens_total: &mut u64) {
+        self.private_kv_tokens += scheduled.q_len;
+        if self.known_tokens <= self.effective_kv_tokens()
+            && self.known_tokens < self.input_tokens + self.output_tokens
+        {
+            let latency = if self.token_latency.is_empty() {
+                now - self.arrival_time
+            } else {
+                now - self.last_time
+            };
+            self.token_latency.push(latency);
+            *generation_tokens_total += 1;
+            self.last_time = now;
+            self.known_tokens += 1;
+        }
+    }
+
     fn new(request: ReadySubRequest) -> Self {
         Self {
             request_id: request.request_id,
@@ -221,6 +265,87 @@ impl ChunkedPrefillScheduler {
 }
 
 impl Scheduler for ChunkedPrefillScheduler {
+    fn policy_defaults(&self) -> Result<(u32, usize)> {
+        Ok((
+            self.effective_max_num_batched_tokens,
+            self.effective_max_batch,
+        ))
+    }
+
+    fn policy_queue(&self) -> Result<Option<Vec<QueuedRequest>>> {
+        if self.running || self.queue.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.queue
+                .iter()
+                .map(|r| QueuedRequest {
+                    completion_node_id: r.completion_node_id,
+                    request_id: r.request_id,
+                    subrequest_index: r.subrequest_index,
+                    arrival_time: r.arrival_time,
+                    input_tokens: r.input_tokens,
+                    committed_tokens: r.known_tokens.saturating_sub(r.input_tokens),
+                    kv_tokens: r.effective_kv_tokens(),
+                    max_q_len: r
+                        .known_tokens
+                        .saturating_sub(r.effective_kv_tokens())
+                        .max(1),
+                    last_token_time: (!r.token_latency.is_empty()).then_some(r.last_time),
+                })
+                .collect(),
+        ))
+    }
+
+    fn schedule_batch(&mut self, items: &[BatchItem]) -> Result<Vec<RequestState>> {
+        anyhow::ensure!(
+            self.shared_memory,
+            "explicit policy batches require shared-memory execution"
+        );
+        anyhow::ensure!(
+            !self.running,
+            "policy cannot submit while an iteration is running"
+        );
+        anyhow::ensure!(
+            !items.is_empty(),
+            "empty policy batch requires a future wakeup"
+        );
+        let available: HashMap<_, _> = self
+            .queue
+            .iter()
+            .map(|r| (r.completion_node_id, r))
+            .collect();
+        let mut selected = HashSet::with_capacity(items.len());
+        let mut batch = Vec::with_capacity(items.len());
+        for item in items {
+            anyhow::ensure!(
+                selected.insert(item.completion_node_id),
+                "duplicate policy batch request"
+            );
+            let request = available
+                .get(&item.completion_node_id)
+                .ok_or_else(|| anyhow!("unknown policy batch request"))?;
+            let maximum = request
+                .known_tokens
+                .saturating_sub(request.effective_kv_tokens())
+                .max(1);
+            anyhow::ensure!(
+                item.q_len > 0 && item.q_len <= maximum,
+                "policy q_len exceeds known tokens"
+            );
+            request
+                .effective_kv_tokens()
+                .checked_add(item.q_len)
+                .ok_or_else(|| anyhow!("policy KV token overflow"))?;
+            batch.push(request.scheduled(item.q_len));
+        }
+        let states = batch.iter().map(|r| r.state).collect();
+        self.admitted.extend(selected);
+        self.current_batch = batch;
+        self.arbitrary_batch = true;
+        self.running = true;
+        Ok(states)
+    }
     fn use_shared_memory(&mut self) -> Result<()> {
         if self.enable_prefix_caching {
             bail!("shared Rooflang KV does not yet support prefix caching");
@@ -232,14 +357,9 @@ impl Scheduler for ChunkedPrefillScheduler {
         Some(self.usable_device_mem)
     }
     fn batch_requests(&self) -> Vec<crate::kv::BatchRequest> {
-        self.queue
+        self.current_batch
             .iter()
-            .take(self.current_batch.len())
-            .map(|r| crate::kv::BatchRequest {
-                request_id: r.request_id,
-                input_tokens: r.input_tokens,
-                output_tokens: r.output_tokens,
-            })
+            .map(|r| r.metadata.clone())
             .collect()
     }
     fn init(
@@ -359,11 +479,7 @@ impl Scheduler for ChunkedPrefillScheduler {
             gpu_bytes += needed_private_bytes;
             self.admitted.insert(request.completion_node_id);
 
-            batch_requests.push(RequestState {
-                q_len: num_tokens,
-                kv_len: effective_kv_tokens,
-                lm_head_len: 1,
-            });
+            batch_requests.push(request.scheduled(num_tokens));
         }
 
         if batch_requests.is_empty() {
@@ -389,8 +505,10 @@ impl Scheduler for ChunkedPrefillScheduler {
         }
 
         self.running = true;
-        self.current_batch = batch_requests.clone();
-        Ok(batch_requests)
+        self.arbitrary_batch = false;
+        let states = batch_requests.iter().map(|r| r.state).collect();
+        self.current_batch = batch_requests;
+        Ok(states)
     }
 
     fn enqueue_sub_request(&mut self, request: ReadySubRequest) {
@@ -400,22 +518,42 @@ impl Scheduler for ChunkedPrefillScheduler {
     fn done_iteration(&mut self, now: f64) -> Vec<SubRequestCompletion> {
         let current_batch = std::mem::take(&mut self.current_batch);
 
+        if self.arbitrary_batch {
+            let selected: HashMap<_, _> = current_batch
+                .iter()
+                .map(|r| (r.completion_node_id, r.state))
+                .collect();
+            let mut completed = Vec::new();
+            let mut next_queue = LinkedList::new();
+            while let Some(mut request) = self.queue.pop_front() {
+                if let Some(state) = selected.get(&request.completion_node_id) {
+                    request.commit(*state, now, &mut self.generation_tokens_total);
+                    if request.known_tokens >= request.input_tokens + request.output_tokens {
+                        self.admitted.remove(&request.completion_node_id);
+                        completed.push(SubRequestCompletion {
+                            request_id: request.request_id,
+                            subrequest_index: request.subrequest_index,
+                            completion_node_id: request.completion_node_id,
+                            token_latency: request.token_latency,
+                        });
+                        continue;
+                    }
+                }
+                next_queue.push_back(request);
+            }
+            self.queue = next_queue;
+            self.running = false;
+            self.arbitrary_batch = false;
+            return completed;
+        }
+
         let mut tail = self.queue.split_off(current_batch.len());
         for (request, scheduled) in self.queue.iter_mut().zip(&current_batch) {
-            request.private_kv_tokens += scheduled.q_len;
-            if request.known_tokens <= request.effective_kv_tokens()
-                && request.known_tokens < request.input_tokens + request.output_tokens
-            {
-                let latency = if request.token_latency.is_empty() {
-                    now - request.arrival_time
-                } else {
-                    now - request.last_time
-                };
-                request.token_latency.push(latency);
-                self.generation_tokens_total += 1;
-                request.last_time = now;
-                request.known_tokens += 1;
-            }
+            assert_eq!(
+                request.completion_node_id, scheduled.completion_node_id,
+                "batch identity changed before commit"
+            );
+            request.commit(scheduled.state, now, &mut self.generation_tokens_total);
 
             if self.enable_prefix_caching {
                 request.publish_shared_prefix(&mut self.prefix_cache, self.block_size);
@@ -453,11 +591,27 @@ impl Scheduler for ChunkedPrefillScheduler {
         let running_tokens = self
             .current_batch
             .iter()
-            .map(|request| u64::from(request.q_len))
+            .map(|request| u64::from(request.state.q_len))
             .sum();
         let mut waiting_requests = 0usize;
         let mut waiting_tokens = 0u64;
-        for request in self.queue.iter().skip(running_requests) {
+        let selected = self.arbitrary_batch.then(|| {
+            self.current_batch
+                .iter()
+                .map(|r| r.completion_node_id)
+                .collect::<HashSet<_>>()
+        });
+        for request in self.queue.iter().skip(if self.arbitrary_batch {
+            0
+        } else {
+            running_requests
+        }) {
+            if selected
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&request.completion_node_id))
+            {
+                continue;
+            }
             waiting_requests += 1;
             waiting_tokens += u64::from(
                 request
@@ -778,5 +932,136 @@ mod tests {
                 .to_string(),
             "block_size must be positive"
         );
+    }
+
+    #[test]
+    fn explicit_batch_preserves_identity_when_skipping_the_middle_request() {
+        let mut scheduler = scheduler(8, false);
+        scheduler.use_shared_memory().unwrap();
+        for id in 0..3 {
+            let mut input = request(8, 2);
+            input.request_id = id;
+            input.completion_node_id = id + 10;
+            scheduler.enqueue_sub_request(input);
+        }
+        let items = [
+            BatchItem {
+                completion_node_id: 12,
+                q_len: 4,
+            },
+            BatchItem {
+                completion_node_id: 10,
+                q_len: 4,
+            },
+        ];
+        let states = scheduler.schedule_batch(&items).unwrap();
+        assert_eq!(
+            states.iter().map(|s| s.q_len).collect::<Vec<_>>(),
+            vec![4, 4]
+        );
+        assert_eq!(
+            scheduler
+                .batch_requests()
+                .iter()
+                .map(|r| r.request_id)
+                .collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+        assert_eq!(scheduler.instance_load().waiting_requests, 1);
+        assert!(scheduler.done_iteration(1.0).is_empty());
+        assert_eq!(
+            scheduler
+                .queue
+                .iter()
+                .map(|r| (r.request_id, r.effective_kv_tokens()))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (1, 0), (2, 4)]
+        );
+        scheduler.schedule_batch(&items).unwrap();
+        scheduler.done_iteration(2.0);
+        assert_eq!(
+            scheduler
+                .queue
+                .iter()
+                .map(|r| (r.request_id, r.known_tokens, r.token_latency.len()))
+                .collect::<Vec<_>>(),
+            vec![(0, 9, 1), (1, 8, 0), (2, 9, 1)]
+        );
+        let final_items = [
+            BatchItem {
+                completion_node_id: 12,
+                q_len: 1,
+            },
+            BatchItem {
+                completion_node_id: 10,
+                q_len: 1,
+            },
+        ];
+        scheduler.schedule_batch(&final_items).unwrap();
+        let completed = scheduler.done_iteration(3.0);
+        assert_eq!(
+            completed.iter().map(|r| r.request_id).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(scheduler.queue.front().unwrap().request_id, 1);
+        assert_eq!(scheduler.queue.front().unwrap().known_tokens, 8);
+        assert_eq!(scheduler.queue.front().unwrap().effective_kv_tokens(), 0);
+        scheduler
+            .schedule_batch(&[BatchItem {
+                completion_node_id: 11,
+                q_len: 8,
+            }])
+            .unwrap();
+        scheduler.done_iteration(4.0);
+        scheduler
+            .schedule_batch(&[BatchItem {
+                completion_node_id: 11,
+                q_len: 1,
+            }])
+            .unwrap();
+        let completed = scheduler.done_iteration(5.0);
+        assert_eq!(completed[0].token_latency, vec![4.0, 1.0]);
+        assert!(scheduler.queue.is_empty());
+    }
+
+    #[test]
+    fn invalid_explicit_batch_does_not_partially_admit_requests() {
+        let mut scheduler = scheduler(8, false);
+        scheduler.use_shared_memory().unwrap();
+        scheduler.enqueue_sub_request(request(4, 1));
+        for items in [
+            vec![],
+            vec![BatchItem {
+                completion_node_id: 0,
+                q_len: 0,
+            }],
+            vec![BatchItem {
+                completion_node_id: 0,
+                q_len: 5,
+            }],
+            vec![
+                BatchItem {
+                    completion_node_id: 0,
+                    q_len: 2
+                };
+                2
+            ],
+            vec![
+                BatchItem {
+                    completion_node_id: 0,
+                    q_len: 2,
+                },
+                BatchItem {
+                    completion_node_id: 99,
+                    q_len: 2,
+                },
+            ],
+        ] {
+            assert!(scheduler.schedule_batch(&items).is_err());
+            assert!(!scheduler.running);
+            assert!(scheduler.current_batch.is_empty());
+            assert!(scheduler.admitted.is_empty());
+            assert_eq!(scheduler.queue.front().unwrap().effective_kv_tokens(), 0);
+        }
     }
 }

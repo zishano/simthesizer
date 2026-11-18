@@ -1,0 +1,251 @@
+# 取自 run_rooflang_shared_workload.sh 的实际参数；这是配置快照，不会自动随脚本变化。
+# P/D 各 1 个 H200 TP4 实例；KV whole；不记录 audit/trace。
+# 复用 topology_pd_config 生成；worker 用当前 Python，适用于容器 /opt/venv。
+
+[system]
+kind = "pd_disaggregation"
+shared_execution = true
+allow_gpu_sharing = false
+kv_handoff = "whole"
+tp = 1
+
+[system.model]
+kind = "llama3_1"
+hidden_size = 4096
+intermediate_size = 14336
+max_position_embeddings = 131072
+num_attention_heads = 32
+num_hidden_layers = 32
+num_key_value_heads = 8
+vocab_size = 128256
+
+[system.network_sim]
+kind = "flow"
+
+[[system.prefill_instances]]
+kind = "single_instance"
+
+[system.prefill_instances.model_runner]
+kind = "rooflang"
+tp = 4
+command = ["python", "scripts/rooflang_worker.py"]
+instance_id = "p0"
+shared_execution = true
+stage = "p"
+
+[system.prefill_instances.model_runner.hardware]
+gpu_model = "h200"
+gpu_count = 4
+gpu_ids = ["cluster/n0-nvidia-h200-sxm-0", "cluster/n0-nvidia-h200-sxm-1", "cluster/n0-nvidia-h200-sxm-2", "cluster/n0-nvidia-h200-sxm-3"]
+
+[system.prefill_instances.model_runner.hardware.topology]
+links = []
+
+[[system.prefill_instances.model_runner.hardware.topology.clusters]]
+id = "cluster"
+gpu_model = "h200"
+n_nodes = 1
+
+[system.prefill_instances.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 128
+device_mem = 144000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.prefill_instances.model]
+kind = "llama3_1"
+hidden_size = 4096
+intermediate_size = 14336
+max_position_embeddings = 131072
+num_attention_heads = 32
+num_hidden_layers = 32
+num_key_value_heads = 8
+vocab_size = 128256
+
+[[system.decode_instances]]
+kind = "single_instance"
+
+[system.decode_instances.model_runner]
+kind = "rooflang"
+tp = 4
+command = ["python", "scripts/rooflang_worker.py"]
+instance_id = "d0"
+shared_execution = true
+stage = "d"
+
+[system.decode_instances.model_runner.hardware]
+gpu_model = "h200"
+gpu_count = 4
+gpu_ids = ["cluster/n0-nvidia-h200-sxm-4", "cluster/n0-nvidia-h200-sxm-5", "cluster/n0-nvidia-h200-sxm-6", "cluster/n0-nvidia-h200-sxm-7"]
+
+[system.decode_instances.model_runner.hardware.topology]
+links = []
+
+[[system.decode_instances.model_runner.hardware.topology.clusters]]
+id = "cluster"
+gpu_model = "h200"
+n_nodes = 1
+
+[system.decode_instances.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 32
+device_mem = 144000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.decode_instances.model]
+kind = "llama3_1"
+hidden_size = 4096
+intermediate_size = 14336
+max_position_embeddings = 131072
+num_attention_heads = 32
+num_hidden_layers = 32
+num_key_value_heads = 8
+vocab_size = 128256
+
+[system.kv_topology]
+devices = ["cluster/ib-switch", "cluster/n0-ddr5-0", "cluster/n0-ddr5-1", "cluster/n0-hbm3e-0", "cluster/n0-hbm3e-1", "cluster/n0-hbm3e-2", "cluster/n0-hbm3e-3", "cluster/n0-hbm3e-4", "cluster/n0-hbm3e-5", "cluster/n0-hbm3e-6", "cluster/n0-hbm3e-7", "cluster/n0-hgx-pcie-switch-0", "cluster/n0-hgx-pcie-switch-1", "cluster/n0-hgx-pcie-switch-2", "cluster/n0-hgx-pcie-switch-3", "cluster/n0-hgx-pcie-switch-4", "cluster/n0-hgx-pcie-switch-5", "cluster/n0-hgx-pcie-switch-6", "cluster/n0-hgx-pcie-switch-7", "cluster/n0-intel-xeon-6767p-0", "cluster/n0-intel-xeon-6767p-1", "cluster/n0-mellanox-cx7-0", "cluster/n0-mellanox-cx7-1", "cluster/n0-mellanox-cx7-2", "cluster/n0-mellanox-cx7-3", "cluster/n0-mellanox-cx7-4", "cluster/n0-mellanox-cx7-5", "cluster/n0-mellanox-cx7-6", "cluster/n0-mellanox-cx7-7", "cluster/n0-nvidia-h200-sxm-0", "cluster/n0-nvidia-h200-sxm-1", "cluster/n0-nvidia-h200-sxm-2", "cluster/n0-nvidia-h200-sxm-3", "cluster/n0-nvidia-h200-sxm-4", "cluster/n0-nvidia-h200-sxm-5", "cluster/n0-nvidia-h200-sxm-6", "cluster/n0-nvidia-h200-sxm-7", "cluster/n0-nvswitch", "cluster/n0-ssd-0", "cluster/n0-ssd-1", "cluster/n0-ssd-2", "cluster/n0-ssd-3", "cluster/n0-ssd-4", "cluster/n0-ssd-5", "cluster/n0-ssd-6", "cluster/n0-ssd-7"]
+shards = 8
+prefill_gpus = [[29, 30, 31, 32]]
+decode_gpus = [[33, 34, 35, 36]]
+
+[[system.kv_topology.links]]
+src = 29
+dst = 37
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-0|cluster/n0-nvswitch|nvlink|fwd"
+
+[[system.kv_topology.links]]
+src = 37
+dst = 33
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-4|cluster/n0-nvswitch|nvlink|rev"
+
+[[system.kv_topology.links]]
+src = 37
+dst = 34
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-5|cluster/n0-nvswitch|nvlink|rev"
+
+[[system.kv_topology.links]]
+src = 37
+dst = 35
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-6|cluster/n0-nvswitch|nvlink|rev"
+
+[[system.kv_topology.links]]
+src = 37
+dst = 36
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-7|cluster/n0-nvswitch|nvlink|rev"
+
+[[system.kv_topology.links]]
+src = 30
+dst = 37
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-1|cluster/n0-nvswitch|nvlink|fwd"
+
+[[system.kv_topology.links]]
+src = 31
+dst = 37
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-2|cluster/n0-nvswitch|nvlink|fwd"
+
+[[system.kv_topology.links]]
+src = 32
+dst = 37
+bandwidth = 450000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-3|cluster/n0-nvswitch|nvlink|fwd"
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 33
+links = [0, 1]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 34
+links = [0, 2]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 35
+links = [0, 3]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 36
+links = [0, 4]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 33
+links = [5, 1]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 34
+links = [5, 2]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 35
+links = [5, 3]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 36
+links = [5, 4]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 33
+links = [6, 1]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 34
+links = [6, 2]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 35
+links = [6, 3]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 36
+links = [6, 4]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 33
+links = [7, 1]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 34
+links = [7, 2]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 35
+links = [7, 3]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 36
+links = [7, 4]
