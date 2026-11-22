@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -92,6 +93,7 @@ class LauncherTests(unittest.TestCase):
         self.write("scenario.toml", '[system]\nkind = "pd_disaggregation"\n')
         self.write("input.jsonl", '{"request_id":0}\n')
         self.write("scripts/code.py", "# fixture\n")
+        self.write(launcher.EVALUATOR_REL, "# fixture evaluator\n")
         self.write(launcher.POLICY_REL / "policy.rs", "// original candidate\n")
         self.config = experiment()
 
@@ -101,7 +103,7 @@ class LauncherTests(unittest.TestCase):
         target.write_text(text)
         return target
 
-    def prepare(self):
+    def prepare(self, *, baseline_mode=None):
         with patch("sys.stdout", new=io.StringIO()):
             return launcher.prepare(
                 self.root,
@@ -109,6 +111,7 @@ class LauncherTests(unittest.TestCase):
                 self.base / "runs",
                 launcher.BUILD_DEFAULTS,
                 "bridge",
+                baseline_mode=baseline_mode,
             )
 
     def test_example_is_rejected_before_docker(self):
@@ -149,6 +152,334 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "only valid when starting"):
                 launcher.main(["--prepare-only", "--build"])
             execute.assert_not_called()
+
+    def test_local_baseline_rejects_conflicting_modes_without_execution(self):
+        for mode in (
+            "--build",
+            "--build-only",
+            "--check",
+            "--prepare-only",
+            "--inside-container",
+        ):
+            with (
+                self.subTest(mode=mode),
+                patch.object(launcher, "command") as execute,
+                self.assertRaisesRegex(ValueError, "--baseline-only only combines"),
+            ):
+                launcher.main(["--baseline-only", mode])
+            execute.assert_not_called()
+
+    def test_new_local_baseline_freezes_mode_without_reading_credentials(self):
+        config = self.write("experiment.toml", "# parsed fixture\n")
+        with (
+            patch.object(launcher.tomllib, "loads", return_value=self.config),
+            patch.object(
+                launcher, "local_baseline", return_value=0
+            ) as prepare_baseline,
+            patch.object(launcher, "check_env_file") as credentials,
+            patch.object(launcher, "image_identity") as image,
+            patch.object(launcher, "supervise") as supervise,
+            patch.object(launcher, "command") as execute,
+            patch("sys.stdout", new=io.StringIO()),
+        ):
+            code = launcher.main(
+                [
+                    "--project",
+                    str(self.root),
+                    "--experiment",
+                    str(config),
+                    "--runs-root",
+                    str(self.base / "runs"),
+                    "--baseline-only",
+                    "--env-file",
+                    str(self.base / "missing.env"),
+                ]
+            )
+        self.assertEqual(code, 0)
+        run, manifest = prepare_baseline.call_args.args
+        self.assertEqual(manifest["baseline_mode"], "local")
+        self.assertEqual(launcher.load_bundle(run), manifest)
+        self.assertIn("Never run a replacement", (run / "task/AGENTS.md").read_text())
+        self.assertEqual(
+            json.loads((run / "supervisor.json").read_text())["consumed_wall_seconds"],
+            0,
+        )
+        credentials.assert_not_called()
+        image.assert_not_called()
+        supervise.assert_not_called()
+        execute.assert_not_called()
+
+    def test_local_baseline_resume_keeps_frozen_run_and_skips_credentials(self):
+        run = self.prepare(baseline_mode="local")
+        with (
+            patch.object(launcher, "prepare") as prepare,
+            patch.object(launcher, "local_baseline", return_value=0) as baseline,
+            patch.object(launcher, "check_env_file") as credentials,
+            patch.object(launcher, "image_identity") as image,
+        ):
+            self.assertEqual(
+                launcher.main(["--baseline-only", "--resume", str(run)]), 0
+            )
+        baseline.assert_called_once_with(run, launcher.load_bundle(run))
+        prepare.assert_not_called()
+        credentials.assert_not_called()
+        image.assert_not_called()
+
+    def test_legacy_run_cannot_be_upgraded_to_local_baseline(self):
+        run = self.prepare()
+        before = (run / "task/manifest.json").read_bytes()
+        with (
+            patch.object(launcher, "command") as execute,
+            self.assertRaisesRegex(ValueError, "create a new --baseline-only run"),
+        ):
+            launcher.main(["--baseline-only", "--resume", str(run)])
+        self.assertEqual((run / "task/manifest.json").read_bytes(), before)
+        execute.assert_not_called()
+
+    def test_local_baseline_uses_frozen_evaluator_and_excludes_api_keys(self):
+        run = self.prepare(baseline_mode="local")
+        manifest = launcher.load_bundle(run)
+        store = MagicMock()
+        with (
+            patch.dict("sys.modules", {"baseline_store": store}),
+            patch.dict(
+                os.environ, {"CODEX_API_KEY": "fixture", "OPENAI_API_KEY": "fixture"}
+            ),
+            patch.object(launcher, "command") as check,
+            patch.object(launcher, "baseline_command") as evaluate,
+            patch("sys.stdout", new=io.StringIO()) as stdout,
+        ):
+            self.assertEqual(launcher.local_baseline(run, manifest), 0)
+        check.assert_called_once()
+        evaluate.assert_called_once()
+        self.assertEqual(check.call_args.args[0][:2], [launcher.sys.executable, "-c"])
+        self.assertIn("sys.version_info[:2] == (3, 14)", check.call_args.args[0][2])
+        self.assertEqual(
+            evaluate.call_args.args[0],
+            [
+                launcher.sys.executable,
+                str(run / "source" / launcher.EVALUATOR_REL),
+                "--manifest",
+                str(run / "task/manifest.json"),
+                "--prepare-baseline",
+            ],
+        )
+        for invocation in (check.call_args, evaluate.call_args):
+            self.assertEqual(invocation.kwargs["cwd"], run / "source")
+            self.assertNotIn("CODEX_API_KEY", invocation.kwargs["env"])
+            self.assertNotIn("OPENAI_API_KEY", invocation.kwargs["env"])
+        store.validate.assert_called_once_with(run, manifest)
+        self.assertIn("--resume", stdout.getvalue())
+
+    def test_failed_local_baseline_retains_progress_and_prints_quoted_resume(self):
+        run = self.prepare(baseline_mode="local")
+        progress = run / "artifacts/partial.json"
+
+        def fail_baseline(argv, **kwargs):
+            if "--prepare-baseline" in argv:
+                progress.write_text('{"attempts":1}')
+                raise subprocess.CalledProcessError(2, argv)
+
+        with (
+            patch.object(launcher, "command"),
+            patch.object(launcher, "baseline_command", side_effect=fail_baseline),
+            patch("sys.stderr", new=io.StringIO()) as stderr,
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            launcher.local_baseline(run, launcher.load_bundle(run))
+        self.assertEqual(progress.read_text(), '{"attempts":1}')
+        resume = stderr.getvalue().split("Resume: ", 1)[1].strip()
+        self.assertEqual(
+            shlex.split(resume)[-3:], ["--baseline-only", "--resume", str(run)]
+        )
+        launcher.load_bundle(run)
+
+    def test_local_baseline_child_exit_failure_is_preserved(self):
+        process = MagicMock()
+        process.wait.return_value = 7
+        process.poll.return_value = 7
+        with (
+            patch.object(launcher.subprocess, "Popen", return_value=process) as start,
+            patch.object(launcher.signal, "signal"),
+            patch.object(launcher.os, "killpg") as kill,
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            launcher.baseline_command(["fixture"], env={}, cwd=self.root)
+        self.assertEqual(raised.exception.returncode, 7)
+        self.assertTrue(start.call_args.kwargs["start_new_session"])
+        kill.assert_not_called()
+
+    def test_local_baseline_signal_terminates_process_group_and_restores_handlers(self):
+        for number in (launcher.signal.SIGINT, launcher.signal.SIGTERM):
+            with self.subTest(signal=number):
+                process = MagicMock(pid=4242)
+                process.poll.return_value = None
+                registered = {}
+                previous = {
+                    launcher.signal.SIGINT: object(),
+                    launcher.signal.SIGTERM: object(),
+                }
+
+                def register(sig, handler, registered=registered, previous=previous):
+                    registered[sig] = handler
+                    return previous[sig]
+
+                def wait(timeout=None, registered=registered, number=number):
+                    if timeout is None:
+                        registered[number](number, None)
+                    return -15
+
+                process.wait.side_effect = wait
+                with (
+                    patch.object(launcher.subprocess, "Popen", return_value=process),
+                    patch.object(
+                        launcher.signal, "signal", side_effect=register
+                    ) as signals,
+                    patch.object(launcher.os, "killpg") as kill,
+                    self.assertRaises(InterruptedError),
+                ):
+                    launcher.baseline_command(["fixture"], env={}, cwd=self.root)
+                kill.assert_called_once_with(4242, launcher.signal.SIGTERM)
+                self.assertEqual(
+                    signals.call_args_list[-2:],
+                    [call(sig, handler) for sig, handler in previous.items()],
+                )
+                process.wait.assert_any_call(timeout=10)
+
+    def test_local_baseline_unresponsive_child_is_killed(self):
+        process = MagicMock(pid=4242)
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            InterruptedError("interrupted"),
+            subprocess.TimeoutExpired(["fixture"], 10),
+            -9,
+        ]
+        with (
+            patch.object(launcher.subprocess, "Popen", return_value=process),
+            patch.object(launcher.signal, "signal"),
+            patch.object(launcher.os, "killpg") as kill,
+            self.assertRaises(InterruptedError),
+        ):
+            launcher.baseline_command(["fixture"], env={}, cwd=self.root)
+        self.assertEqual(
+            kill.call_args_list,
+            [call(4242, launcher.signal.SIGTERM), call(4242, launcher.signal.SIGKILL)],
+        )
+        process.wait.assert_any_call(timeout=5)
+
+    def test_local_sigterm_allows_evaluator_to_reap_its_separate_session(self):
+        evaluator = self.base / "fake-evaluator.py"
+        evaluator.write_text(
+            """import pathlib, signal, subprocess, sys, time
+root = pathlib.Path(sys.argv[1])
+worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+def interrupted(number, frame):
+    worker.terminate()
+    worker.wait(timeout=5)
+    (root / "cleaned").write_text("yes")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, interrupted)
+(root / "ready").write_text(str(worker.pid))
+while True:
+    time.sleep(1)
+"""
+        )
+        helper = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(launcher.HERE)!r})\n"
+            "import launcher\n"
+            "try:\n"
+            f"    launcher.baseline_command([sys.executable, {str(evaluator)!r}, {str(self.base)!r}], "
+            f"env=os.environ.copy(), cwd={str(self.base)!r})\n"
+            "except InterruptedError:\n"
+            "    sys.exit(130)\n"
+        )
+        worker_pid = None
+        with subprocess.Popen(
+            [launcher.sys.executable, "-c", helper],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        ) as process:
+            try:
+                deadline = time.monotonic() + 5
+                while (
+                    not (self.base / "ready").exists() and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertTrue((self.base / "ready").exists())
+                worker_pid = int((self.base / "ready").read_text())
+                process.send_signal(launcher.signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 130, (stdout, stderr))
+                self.assertEqual((self.base / "cleaned").read_text(), "yes")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(worker_pid, 0)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
+                if worker_pid is not None:
+                    try:
+                        os.killpg(worker_pid, launcher.signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_local_baseline_cannot_overlap_recorded_container(self):
+        run = self.prepare(baseline_mode="local")
+        launcher.save(
+            run / "supervisor.json",
+            {"consumed_wall_seconds": 0, "active": {"container": "owned-container"}},
+        )
+        with (
+            patch.object(launcher, "command") as execute,
+            self.assertRaisesRegex(ValueError, "cannot run concurrently"),
+        ):
+            launcher.local_baseline(run, launcher.load_bundle(run))
+        execute.assert_not_called()
+
+    def test_local_search_rejects_unsealed_baseline_before_credentials_or_docker(self):
+        run = self.prepare(baseline_mode="local")
+        store = MagicMock()
+        store.validate.side_effect = ValueError("baseline is incomplete")
+        with (
+            patch.dict("sys.modules", {"baseline_store": store}),
+            patch.object(launcher, "check_env_file") as credentials,
+            patch.object(launcher, "image_identity") as image,
+            patch.object(launcher, "supervise") as supervise,
+            self.assertRaisesRegex(ValueError, "baseline is incomplete"),
+        ):
+            launcher.main(
+                ["--resume", str(run), "--env-file", str(self.base / "missing.env")]
+            )
+        store.validate.assert_called_once_with(run, launcher.load_bundle(run))
+        credentials.assert_not_called()
+        image.assert_not_called()
+        supervise.assert_not_called()
+
+    def test_local_search_passes_validated_baseline_to_supervisor(self):
+        run = self.prepare(baseline_mode="local")
+        store = MagicMock()
+        store.validate.return_value = {
+            "accounting": {"attempts": 2, "wall_seconds": 3.0}
+        }
+        with (
+            patch.dict("sys.modules", {"baseline_store": store}),
+            patch.object(launcher, "check_env_file"),
+            patch.object(launcher, "image_identity", return_value="test-image"),
+            patch.object(launcher, "supervise", return_value=0) as supervise,
+        ):
+            code = launcher.main(
+                ["--resume", str(run), "--env-file", str(self.base / "env")]
+            )
+        self.assertEqual(code, 0)
+        self.assertIs(
+            supervise.call_args.kwargs["baseline"], store.validate.return_value
+        )
 
     def test_snapshot_excludes_credentials_and_unselected_data(self):
         for path in (
@@ -244,6 +575,28 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args[-1], "sha256:fixture")
         self.assertIn(str(run), " ".join(args))
         self.assertIn("--memory-swap", args)
+
+    def test_local_baseline_mount_is_readonly_inside_writable_artifacts(self):
+        run = self.prepare(baseline_mode="local")
+        args = launcher.docker_arguments(
+            run, launcher.load_bundle(run), "test-image", self.base / "env"
+        )
+        mounts = [
+            args[index + 1]
+            for index, argument in enumerate(args)
+            if argument == "--mount"
+        ]
+        parent = f"type=bind,source={run / 'artifacts'},target=/workspace/artifacts"
+        sealed = (
+            f"type=bind,source={run / 'artifacts/baseline'},"
+            "target=/workspace/artifacts/baseline,readonly"
+        )
+        self.assertIn(parent, mounts)
+        self.assertIn(sealed, mounts)
+        self.assertLess(mounts.index(parent), mounts.index(sealed))
+        self.assertEqual(
+            len([mount for mount in mounts if not mount.endswith(",readonly")]), 3
+        )
 
     def test_build_context_is_minimal(self):
         self.write("scripts/private.env", "secret")
@@ -795,6 +1148,52 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exhausted"):
                 launcher.supervise(run, manifest, "test-image", self.base / "agent.env")
             execute.assert_not_called()
+
+    def test_local_baseline_budget_is_added_to_container_time_without_rewriting_it(
+        self,
+    ):
+        run = self.prepare(baseline_mode="local")
+        manifest = launcher.load_bundle(run)
+        launcher.save(
+            run / "supervisor.json", {"consumed_wall_seconds": 2, "active": None}
+        )
+        baseline = {"accounting": {"attempts": 2, "wall_seconds": 8.0}}
+        for _ in range(2):
+            with (
+                patch.object(launcher, "output") as execute,
+                self.assertRaisesRegex(ValueError, "budget is exhausted"),
+            ):
+                launcher.supervise(
+                    run, manifest, "test-image", self.base / "env", baseline=baseline
+                )
+            execute.assert_not_called()
+            self.assertEqual(
+                json.loads((run / "supervisor.json").read_text())[
+                    "consumed_wall_seconds"
+                ],
+                2,
+            )
+
+    def test_local_baseline_is_charged_once_across_successful_resumes(self):
+        run = self.prepare(baseline_mode="local")
+        manifest = launcher.load_bundle(run)
+        baseline = {"accounting": {"attempts": 2, "wall_seconds": 8.0}}
+        with patch.dict(os.environ, self.fake_docker()):
+            for _ in range(2):
+                self.assertEqual(
+                    launcher.supervise(
+                        run,
+                        manifest,
+                        "test-image",
+                        self.base / "env",
+                        baseline=baseline,
+                    ),
+                    0,
+                )
+        state = json.loads((run / "supervisor.json").read_text())
+        self.assertGreater(state["consumed_wall_seconds"], 0)
+        self.assertLess(state["consumed_wall_seconds"], 2)
+        self.assertIsNone(state["active"])
 
     def fake_docker(self):
         binary = self.base / "bin/docker"

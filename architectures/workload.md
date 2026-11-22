@@ -53,6 +53,8 @@ drifting apart.
   it reads and requires every LLM's latency count to equal `output_tokens`.
 - Raw agent traces are converted to canonical rows offline. Runtime accepts
   only canonical rows.
+- JSON timing values preserve their nearest binary64 value through Rust/Python
+  round trips; result validation compares input metadata exactly.
 
 ## Evolution Rules
 

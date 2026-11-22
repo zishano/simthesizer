@@ -77,9 +77,14 @@ requires a new evaluation split/version.
 
 ## Stop, resume and report
 
-Stop on an external budget or configured stagnation limit; do not claim global
-optimality. Save frontier references, hypotheses, unresolved issues and exact
-unfinished case IDs. Resume from retained artifacts only after identity checks.
+Continue until the external trial or wall-time budget is exhausted or cannot
+fit another complete trial. Do not stop for stagnation, consecutive
+non-improvements, or an exhausted candidate queue. Generate new hypotheses when
+the queue is exhausted; do not introduce a stagnation limit. Stop early only
+for an unrecoverable correctness or infrastructure blocker, or a user stop.
+Do not claim global optimality. Save frontier references, hypotheses, unresolved
+issues and exact unfinished case IDs. Resume from retained artifacts only after
+identity checks.
 
 Report tested cases, completed-request counts, SLO thresholds/pass fractions,
 frontier coordinates and policy IDs, gains/retained tradeoffs, regressions,

@@ -5,15 +5,28 @@ ARG NODE_IMAGE=node:26.7.0-bookworm-slim
 FROM ${UV_IMAGE} AS uv
 FROM ${NODE_IMAGE} AS agent
 ARG CODEX_VERSION=0.166.0
-RUN npm install --global --include=optional "@openai/codex@${CODEX_VERSION}" \
-    && codex --version
+# Install the native package as required: npm may silently drop failed optional downloads.
+RUN set -eu; \
+    npm_install() { npm install --global --omit=optional --no-audit --no-fund \
+        --fetch-retries=3 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=10000 "$@"; }; \
+    npm_install "@openai/codex@${CODEX_VERSION}"; \
+    native_package="$(node -e ' \
+        const {arch, platform} = process; \
+        if (platform !== "linux" || !["x64", "arm64"].includes(arch)) \
+            throw new Error("Unsupported Codex build platform: " + platform + "/" + arch); \
+        const name = "@openai/codex-linux-" + arch; \
+        const manifest = require("/usr/local/lib/node_modules/@openai/codex/package.json"); \
+        const spec = manifest.optionalDependencies?.[name]; \
+        if (typeof spec !== "string" || !spec) throw new Error("Missing native package declaration: " + name); \
+        process.stdout.write(name + "@" + spec); \
+    ')"; \
+    npm_install "$native_package"; \
+    codex --version; \
+    test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"
 
 FROM ${PYTHON_IMAGE}
 ARG RUST_VERSION=1.96.0
 ARG CODEX_VERSION=0.166.0
-ARG BUILD_INPUT_SHA256
-LABEL io.simthesizer.agent.build-input-sha256=${BUILD_INPUT_SHA256} \
-      io.simthesizer.agent.codex-version=${CODEX_VERSION}
 
 # HTTPS avoids proxy handling of plain HTTP repositories. Disable pipelining
 # and retry transient downloads without relaxing repository or TLS verification.
@@ -57,7 +70,7 @@ RUN mkdir -p /opt/cargo-project/crates/simthesizer-core/src \
     && cargo fetch --locked --manifest-path /opt/cargo-project/Cargo.toml \
     && chmod -R a+rX /opt/cargo-seed /opt/rustup /opt/venv
 
-COPY entrypoint.sh launcher.py /opt/sim-agent/
+COPY entrypoint.sh launcher.py baseline_store.py /opt/sim-agent/
 RUN chmod 0755 /opt/sim-agent/entrypoint.sh \
     && mkdir -p /workspace/simthesizer /workspace/task /workspace/inputs \
         /workspace/artifacts /workspace/cache /home/agent \
@@ -80,3 +93,8 @@ ENV HOME=/home/agent CODEX_HOME=/home/agent/.codex \
     XDG_STATE_HOME=/home/agent/.local/state XDG_CACHE_HOME=/workspace/cache/xdg
 WORKDIR /workspace/simthesizer
 ENTRYPOINT ["/opt/sim-agent/entrypoint.sh"]
+
+# Identity changes must not invalidate unrelated dependency installation layers.
+ARG BUILD_INPUT_SHA256
+LABEL io.simthesizer.agent.build-input-sha256=${BUILD_INPUT_SHA256} \
+      io.simthesizer.agent.codex-version=${CODEX_VERSION}

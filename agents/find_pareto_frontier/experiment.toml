@@ -53,7 +53,7 @@ image = "simthesizer-pareto-agent:codex-0.166.0"
 # 初始上限：100 次尝试，累计 2 小时，单次 10 分钟。
 seed = 0
 max_trials = 100
-max_wall_seconds = 7200
+max_wall_seconds = 86400
 trial_wall_seconds = 1800
 
 [verification]

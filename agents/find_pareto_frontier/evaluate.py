@@ -4,19 +4,21 @@ import argparse
 import copy
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 import os
+import platform
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import time
 import tomllib
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+import baseline_store
 import launcher
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,7 +33,7 @@ from results import (
 )
 from rooflang_bridge.configuration import toml_document
 
-VERSION = "serving-evaluator-v1"
+VERSION = baseline_store.VERSION
 API_VERSION = "serving-policy-v1"
 POLICY = launcher.POLICY_REL
 LIMITS = (
@@ -58,6 +60,7 @@ def runtime_tool_paths():
     paths = {
         str(launcher.AGENT_REL / "evaluate.py"): Path(__file__),
         str(launcher.AGENT_REL / "launcher.py"): Path(launcher.__file__),
+        str(launcher.AGENT_REL / "baseline_store.py"): Path(baseline_store.__file__),
         "scripts/results.py": Path(sys.modules["results"].__file__),
         "scripts/rooflang_bridge/configuration.py": Path(
             sys.modules["rooflang_bridge.configuration"].__file__
@@ -84,7 +87,24 @@ def ledger(path):
     return [json.loads(row) for row in path.read_text().splitlines() if row.strip()]
 
 
-def clean_environment(cache):
+def in_container():
+    return Path("/.dockerenv").exists()
+
+
+def build_environment():
+    return {
+        "domain": "container" if in_container() else "host",
+        "python": sys.version,
+        "implementation": sys.implementation.name,
+        "soabi": sysconfig.get_config_var("SOABI"),
+        "platform": sysconfig.get_platform(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "libc": list(platform.libc_ver()),
+    }
+
+
+def clean_environment(cache, build_identity=None):
     allowed = {
         "PATH",
         "HOME",
@@ -100,7 +120,9 @@ def clean_environment(cache):
     env = {key: value for key, value in os.environ.items() if key in allowed}
     env.update(
         {
-            "CARGO_TARGET_DIR": str(cache / "target"),
+            "CARGO_TARGET_DIR": str(
+                cache / "targets" / identity(build_identity or build_environment())
+            ),
             "CARGO_NET_OFFLINE": "true",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
@@ -161,7 +183,7 @@ def run_process(command, *, cwd, env, log, deadline):
 
 
 class Experiment:
-    def __init__(self, manifest):
+    def __init__(self, manifest, *, independent_replay=False):
         self.manifest_path = Path(manifest).resolve()
         self.run = self.manifest_path.parent.parent
         self.manifest = read_json(self.manifest_path)
@@ -173,14 +195,13 @@ class Experiment:
         self.artifacts = self.run / "artifacts"
         self.cache = self.run / "cache"
         self.baseline = self.run / "baseline-policy"
-        self.env = clean_environment(self.cache)
-        self.python_identity = {
-            "python": sys.version,
-            "packages": {
-                name: importlib.metadata.version(name)
-                for name in ("networkx", "matplotlib")
-            },
-        }
+        self.build_identity = build_environment()
+        self.env = clean_environment(self.cache, self.build_identity)
+        self.python_identity = baseline_store.result_environment()
+        self.local_baseline = self.manifest.get("baseline_mode") == "local"
+        self.independent_replay = independent_replay
+        self.preparing_baseline = False
+        self.baseline_index = None
         self.book = self.artifacts / "experiments.jsonl"
         self.verify_inputs()
         for relative, actual in runtime_tool_paths().items():
@@ -270,21 +291,110 @@ class Experiment:
                 raise ValueError("policy search currently supports one LLM per request")
 
     def cases(self):
-        result = []
-        for workload in self.config["workloads"]:
-            for multiplier in self.config["loads"]["arrival_rate_multipliers"]:
-                case = {
-                    "workload_id": workload["id"],
-                    "workload_path": workload["path"],
-                    "split": workload["split"],
-                    "arrival_multiplier": multiplier,
-                    "seed": self.config["search"]["seed"],
-                }
-                case["id"] = f"{workload['id']}-m{float(multiplier)!r}-s{case['seed']}"
-                result.append(case)
-        if len({case["id"] for case in result}) != len(result):
-            raise ValueError("duplicate case identities")
-        return result
+        return baseline_store.cases(self.manifest)
+
+    def check_baseline(self):
+        index = baseline_store.validate(self.run, self.manifest)
+        if index["result_environment"] != self.python_identity:
+            raise ValueError(
+                "baseline result environment differs (Python version, implementation, OS/architecture or numerical packages)"
+            )
+        self.baseline_index = index
+        return index
+
+    def records(self):
+        rows = ledger(self.book)
+        if self.local_baseline and not self.independent_replay:
+            index = self.baseline_index or self.check_baseline()
+            return index["records"] + [
+                row for row in rows if row.get("kind") != "reference"
+            ]
+        return rows
+
+    def accounting(self, *, baseline_only=False):
+        events = ledger(self.book)
+        if baseline_only:
+            events = [row for row in events if row.get("kind") == "reference"]
+        sealed = None
+        if (
+            self.local_baseline
+            and not self.preparing_baseline
+            and not self.independent_replay
+        ):
+            sealed = (self.baseline_index or self.check_baseline())["accounting"]
+            events = [row for row in events if row.get("kind") != "reference"]
+        starts = {row["attempt"]: row for row in events if row["event"] == "started"}
+        ends = {row["attempt"]: row for row in events if row["event"] == "finished"}
+        charged = []
+        for key, start in starts.items():
+            end = ends.get(key)
+            limit = start.get(
+                "budget_wall_seconds", self.config["search"]["trial_wall_seconds"]
+            )
+            # A crashed attempt consumed a reserved slot; charge at most its
+            # deadline, never the user's subsequent offline waiting time.
+            wall = (
+                end["wall_seconds"]
+                if end
+                else min(limit, max(0, time.time() - start["started_at"]))
+            )
+            charged.append({"started": start, "finished": end, "wall_seconds": wall})
+        return {
+            "attempts": len(charged) + (sealed["attempts"] if sealed else 0),
+            "wall_seconds": sum(row["wall_seconds"] for row in charged)
+            + (sealed["wall_seconds"] if sealed else 0),
+            "charges": (sealed["charges"] if sealed else []) + charged,
+        }
+
+    def prepare_baseline(self):
+        if not self.local_baseline:
+            raise ValueError(
+                "--prepare-baseline requires a run frozen with baseline_mode=local"
+            )
+        if self.run == Path("/workspace") or in_container():
+            raise ValueError("baseline preparation must run on the host")
+        if (self.run / "task/baseline.json").exists():
+            index = self.check_baseline()
+            print(
+                f"Baseline: reused {len(index['records'])} sealed cases",
+                file=sys.stderr,
+                flush=True,
+            )
+            return index
+        self.preparing_baseline = True
+        try:
+            reference = self.freeze_candidate(baseline=True)
+            records = []
+            cases = self.cases()
+            for number, case in enumerate(cases, 1):
+                print(
+                    f"Baseline {number}/{len(cases)} {case['id']}: starting",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                row = self.evaluate(reference, case)
+                records.append(row)
+                action = "reused" if row.get("reused") else "finished"
+                print(
+                    f"Baseline {number}/{len(cases)} {case['id']}: {action}, {row['status']}, {row['wall_seconds']:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if row["status"] not in {"VALID_FEASIBLE", "VALID_INFEASIBLE"}:
+                    raise ValueError(
+                        "baseline is incomplete or invalid; inspect artifacts/experiments.jsonl and retry within the remaining budget"
+                    )
+            index = baseline_store.seal(
+                self.run,
+                self.manifest,
+                self.python_identity,
+                records,
+                self.accounting(baseline_only=True),
+            )
+            self.baseline_index = index
+            return index
+        finally:
+            self.preparing_baseline = False
 
     def freeze_candidate(self, baseline=False):
         source = self.baseline if baseline else self.source / POLICY
@@ -325,6 +435,7 @@ class Experiment:
                 "installed Rust toolchain differs from the frozen build version"
             )
         tools.update(self.python_identity)
+        tools["build_environment"] = self.build_identity
         build_key = identity(
             {
                 "base": self.manifest["source_sha256"],
@@ -354,6 +465,7 @@ class Experiment:
         if launcher.inventory(source, mutable=True) != self.manifest["source_sha256"]:
             raise ValueError("build source differs from frozen source")
         env = dict(self.env)
+        env["CARGO_TARGET_DIR"] = str(self.cache / "targets" / identity(tools))
         if clean:
             env["CARGO_TARGET_DIR"] = str(target / "clean-target")
         run_process(
@@ -433,34 +545,22 @@ class Experiment:
         return config
 
     def trial_identity(self, candidate, case, rows):
-        group = {
-            "version": VERSION,
-            "base": self.manifest["source_sha256"],
-            "inputs": self.manifest["inputs_sha256"],
-            "build_versions": self.manifest["build_versions"],
-            "python_environment": self.python_identity,
-            "case": case,
-            "derived_workload_sha256": identity(rows),
-            "slo": self.config["slo"],
-            "model_assumptions": self.config["model_assumptions"],
-            "policy": self.config["policy"],
-        }
-        return identity({"group": group, "candidate": candidate}), identity(group)
+        return baseline_store.trial_identity(
+            self.manifest, self.python_identity, candidate, case, rows
+        )
 
     def reserve(self, trial_id, group_id, candidate, case, directory):
         events = ledger(self.book)
-        starts = {row["attempt"]: row for row in events if row["event"] == "started"}
-        ends = {row["attempt"]: row for row in events if row["event"] == "finished"}
-        elapsed = sum(
-            ends[key]["wall_seconds"]
-            if key in ends
-            else max(0, time.time() - value["started_at"])
-            for key, value in starts.items()
-        )
+        charged = self.accounting()
+        elapsed = charged["wall_seconds"]
         budget = self.config["search"]
-        if len(starts) >= budget["max_trials"] or elapsed >= budget["max_wall_seconds"]:
+        if (
+            charged["attempts"] >= budget["max_trials"]
+            or elapsed >= budget["max_wall_seconds"]
+        ):
             raise ValueError("search evaluation budget exhausted")
-        attempt = len(starts) + 1
+        attempt = max((row["attempt"] for row in events), default=0) + 1
+        wall = min(budget["trial_wall_seconds"], budget["max_wall_seconds"] - elapsed)
         record = {
             "event": "started",
             "attempt": attempt,
@@ -470,14 +570,29 @@ class Experiment:
             "kind": candidate["kind"],
             "case": case,
             "started_at": time.time(),
+            "budget_wall_seconds": wall,
             "directory": str(directory.relative_to(self.artifacts)),
         }
         append(self.book, record)
-        return record, time.monotonic() + min(
-            budget["trial_wall_seconds"], budget["max_wall_seconds"] - elapsed
-        )
+        return record, time.monotonic() + wall
 
     def evaluate(self, candidate, case, *, force=False, clean=False):
+        if (
+            self.local_baseline
+            and not self.preparing_baseline
+            and not self.independent_replay
+        ):
+            index = self.baseline_index or self.check_baseline()
+            if candidate["kind"] == "reference":
+                if candidate != index["reference"]:
+                    raise ValueError(
+                        "reference identity differs from the sealed baseline"
+                    )
+                return next(
+                    {**row, "reused": True}
+                    for row in index["records"]
+                    if row["case"] == case
+                )
         rows = self.derived(case)
         trial_id, group_id = self.trial_identity(candidate, case, rows)
         events = ledger(self.book)
@@ -597,16 +712,7 @@ class Experiment:
                     "tpot_applicable": metrics["slo"]["tpot_applicable"],
                     "evidence_sha256": {
                         name: launcher.digest(directory / name)
-                        for name in (
-                            "result.jsonl",
-                            "metrics.json",
-                            "config.toml",
-                            "workload.jsonl",
-                            "build.json",
-                            "policy-stats.json",
-                            "metrics.png",
-                            "throughput.png",
-                        )
+                        for name in baseline_store.EVIDENCE
                     },
                 }
             )
@@ -652,6 +758,8 @@ def main(argv=None):
     modes.add_argument("--list-cases", action="store_true")
     modes.add_argument("--baseline", action="store_true")
     modes.add_argument("--candidate", action="store_true")
+    modes.add_argument("--prepare-baseline", action="store_true")
+    modes.add_argument("--check-baseline", action="store_true")
     parser.add_argument("--case", action="append", default=[])
     args = parser.parse_args(argv)
     experiment = Experiment(args.manifest)
@@ -661,6 +769,20 @@ def main(argv=None):
         if args.list_cases:
             print(json.dumps(experiment.cases(), indent=2))
             return 0
+        if args.prepare_baseline or args.check_baseline:
+            if args.case:
+                parser.error(
+                    "baseline preparation/check requires the complete case matrix"
+                )
+            index = (
+                experiment.prepare_baseline()
+                if args.prepare_baseline
+                else experiment.check_baseline()
+            )
+            print(json.dumps({"ready": True, "baseline": index}, indent=2))
+            return 0
+        if experiment.local_baseline:
+            experiment.check_baseline()
         candidate = experiment.freeze_candidate(
             baseline=args.baseline or args.preflight
         )

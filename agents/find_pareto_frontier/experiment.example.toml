@@ -61,7 +61,7 @@ seed = 0
 max_trials = "REQUIRED: positive integer; includes failed attempts"
 max_wall_seconds = "REQUIRED: positive integer"
 trial_wall_seconds = "REQUIRED: positive integer"
-# 可选 stagnation_trials 必须为正整数；不能解释为证明最优。
+# 不因连续无改进提前停止；候选耗尽后继续提出假设，直到预算不足。
 
 [verification]
 # 独立复验不无限续用搜索预算；每次尝试也受 trial_wall_seconds 限制。

@@ -1,7 +1,6 @@
 """Derive provisional per-case Pareto sets from completed evaluation receipts."""
 
 import argparse
-import json
 from pathlib import Path
 
 import launcher
@@ -54,13 +53,7 @@ def update_archive(artifacts):
     experiment = Experiment(artifacts.parent / "task/manifest.json")
     if experiment.artifacts.resolve() != artifacts.resolve():
         raise ValueError("archive must use the frozen run's artifacts directory")
-    path = artifacts / "experiments.jsonl"
-    rows = (
-        [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        if path.exists()
-        else []
-    )
-    groups = pareto(rows)
+    groups = pareto(experiment.records())
     launcher.save(
         artifacts / "frontier.json", {"verification": "provisional", "groups": groups}
     )

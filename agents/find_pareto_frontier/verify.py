@@ -44,7 +44,7 @@ def replay_candidate(original, candidate_id, selected):
         raise ValueError("unknown verification case")
     cases = [case for case in cases if not selected or case["id"] in selected]
     receipts = {}
-    for row in evaluate.ledger(original.book):
+    for row in original.records():
         if (
             row.get("event") == "finished"
             and row.get("candidate_id") == candidate_id
@@ -108,7 +108,9 @@ def replay_candidate(original, candidate_id, selected):
     (destination / "task/AGENTS.md").write_text(
         launcher.render_task(destination / "source", frozen)
     )
-    replay = evaluate.Experiment(destination / "task/manifest.json")
+    replay = evaluate.Experiment(
+        destination / "task/manifest.json", independent_replay=True
+    )
     # This ledger is outside every search-container mount. Repeated external
     # verification calls share the frozen budget instead of resetting it.
     replay.book = original.run / "verified/experiments.jsonl"

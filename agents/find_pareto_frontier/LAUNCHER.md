@@ -9,6 +9,7 @@
 | [Dockerfile](Dockerfile) | Python 3.14.5、Rust 1.96.0、uv 0.11.19、Codex 0.166.0；安装核心 Python 依赖和 ruff，排除 vLLM；缓存 Cargo.lock 依赖 |
 | [run-agent.sh](run-agent.sh) | 从任意目录定位项目，选用项目 Python，进入 launcher；宿主只需 Python 3.11+，无需安装 Codex |
 | [launcher.py](launcher.py) | 参数与配置检查、最小构建上下文、源码/输入快照、只读任务、Docker argv、镜像身份校验、墙钟监督及恢复 |
+| [baseline_store.py](baseline_store.py) | 封存基线索引与证据校验；宿主和容器共用同一契约 |
 | [entrypoint.sh](entrypoint.sh) | 检查挂载、初始化独立缓存、运行容器身份/评测器预检，最后启动 agent；不自动升级或同步依赖 |
 
 依赖版本来自本机已安装工具/包元数据，镜像构建仍需实际确认其下载可用性。Codex 安装使用官方支持的 [npm 方式](https://learn.chatgpt.com/docs/codex/cli)，显式安装平台依赖；构建时检查版本及所需 CLI 参数。执行使用官方 [非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)。凭据不参与构建。
@@ -35,6 +36,8 @@
 ```
 
 build-only 不读取实验参数或 API key，也不运行仿真/agent。仅将 Dockerfile、启动器、Python/Cargo manifests 与 lockfiles 送入临时构建上下文；不发送源码、output、workload、runs 或凭据。镜像带构建输入哈希，运行时校验标签并记录实际 image ID。
+
+Codex 主包固定版本；安装时读取它声明的 Linux x64/arm64 平台包，并将其作为必需依赖安装，避免 npm 忽略可选包下载失败。构建会校验实际 CLI 版本，不自动升级到 latest。身份标签在最后写入，避免哈希变化使无关依赖层失去缓存。
 
 可配置 `--python-image`、`--uv-image`、`--node-image`、`--rust-version`、`--codex-version`、`--buildkit-image` 和 `--image`。Python 镜像必须提供 3.14；Codex 版本应同步写入实验配置。
 
@@ -70,7 +73,7 @@ docker run --rm --network none simthesizer-pareto-agent:codex-0.166.0 --check-en
 
 共 8 张独立 GPU，模型为 FP16 Llama 3.1 8B；使用 shared 执行、whole KV 交接及预设硬件图。完整沿用 `realistic.jsonl` 的 100 条请求，关闭 reports/full_graphs。原脚本的 TP2 注释过时，本配置取实际 TP4 值。
 
-初始设置为 TTFT≤5s、TPOT≤50ms、联合达标率≥95%，100 次试验/2 小时/单次 30 分钟；agent 模型为 `gpt-6.1-sol`。到达倍率、搜索边界、复验及容器预算也在 TOML 中明确列出，可按目标修改。当前只配置训练负载，没有独立验证集或 holdout。
+初始设置为 TTFT≤5s、TPOT≤50ms、联合达标率≥95%；试验次数、累计墙钟和单次时限以实验 TOML 为准，agent 模型为 `gpt-6.1-sol`。到达倍率、搜索边界、复验及容器预算也在 TOML 中明确列出，可按目标修改。当前只配置训练负载，没有独立验证集或 holdout。
 
 ```sh
 ./run_rooflang_agent.sh --check
@@ -86,6 +89,32 @@ GPU 型号/数量/并行划分来自 `inputs.scenario`，这里不重复维护�
 ```
 
 prepare-only 不调用 Docker/API。有效配置可先冻结为 `runs/YYYYMMDD-HHMMSS[-序号]/`，同时列出尚缺的运行能力。默认仅复制必要源码目录、场景模板和显式 workload/assets；排除历史报告、构建产物、宿主工具配置和凭据。核心未准备好的快照不能在补写宿主代码后原地升级；需新建 run。
+
+## 本地基线 → Docker 搜索
+
+```sh
+# 本次功能更新后先重建镜像一次；不启动 agent。
+./run_rooflang_agent.sh --build-only
+
+# 新建冻结实验，在宿主完成所有 workload × 到达倍率基线。
+./run_rooflang_baseline.sh
+
+# 使用上一步输出的同一目录，不新建实验、不再构建镜像。
+./run_rooflang_agent.sh --resume agents/find_pareto_frontier/runs/<时间目录>
+
+# 本地基线中断后续跑；已完成的案例直接复用。
+./run_rooflang_baseline.sh --resume agents/find_pareto_frontier/runs/<时间目录>
+```
+
+新脚本参数集中在脚本开头：`EXPERIMENT`、`RESULTS_DIR`、`AGENT_NETWORK`；`SIM_AGENT_PYTHON` 可选择本地解释器，默认项目 `.venv/bin/python`。本地阶段不读取 `agent.env`，不启动 Docker/API。Rust 及 Python/相关依赖版本须与冻结实验和镜像兼容；版本不匹配时对齐环境，不通过修改旧 manifest 绕过校验。
+
+该流程将 `baseline_mode=local` 写入新 run。`artifacts/baseline/` 保存封存索引、完整结果、指标图及配置/负载/构建证据，`task/baseline.json` 绑定其身份。容器额外只读挂载基线目录；普通候选 artifacts 仍可写。完整但未满足 SLO 的基线可作对照，未完成、缺案例、身份不符或证据被改动均拒绝启动搜索，不静默补跑基线。
+
+结果比较保留 Python 精确版本、相关依赖版本及平台身份；完整 Python 构建字符串留作来源信息，不因编译时间或安装路径变化产生另一比较组。宿主和容器分别保存编译缓存；容器预检仍可编译并检查能力，但不会重跑基线仿真。封存基线的试验次数和本地耗时计入原总预算一次，恢复和复用不重复扣除。
+
+底层入口为 `run-agent.sh --baseline-only --experiment ...`，本地续跑为 `--baseline-only --resume RUN_DIR`。旧模式仍兼容；旧冻结 run 不原地升级，本地复用流程使用新脚本创建新 run。
+
+## 直接在容器中生成基线
 
 启动：
 
@@ -106,6 +135,7 @@ prepare-only 不调用 Docker/API。有效配置可先冻结为 `runs/YYYYMMDD-H
 | `/workspace/baseline-policy` | 原始候选源码，只读 |
 | `/workspace/task`、`/workspace/inputs` | 只读 manifest、AGENTS、场景与声明的负载/资产 |
 | `/workspace/artifacts` | 候选、结果、指标图、实验记录；不含外部 VERIFIED 结果 |
+| `/workspace/artifacts/baseline` | 本地基线模式的封存证据，只读子挂载 |
 | `/workspace/cache` | Cargo target/registry、uv、绘图缓存；不作为性能证据 |
 | `/home/agent`、`/tmp` | 限大小 tmpfs，按宿主 UID/GID 使用，每次重建 |
 

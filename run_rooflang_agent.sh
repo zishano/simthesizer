@@ -29,6 +29,8 @@ usage() {
   --resume RUN_DIR   恢复已有实验，沿用冻结配置及剩余预算
   --help             显示此帮助
 
+先在本地跑基线：./run_rooflang_baseline.sh
+完成后：./run_rooflang_agent.sh --resume RUN_DIR（校验并复用已封存基线）
 已提供 experiment.toml：沿用 shared workload 脚本的 P/D H200 TP4、100 请求。
 运行前可调整该文件中的初始 SLO、搜索范围与预算。
 首次配置凭据（检查/准备不需要）：

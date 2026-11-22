@@ -10,6 +10,7 @@ import math
 import os
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import subprocess
@@ -40,6 +41,7 @@ BUILD_FILES = {
     "Dockerfile": AGENT_REL / "Dockerfile",
     "entrypoint.sh": AGENT_REL / "entrypoint.sh",
     "launcher.py": AGENT_REL / "launcher.py",
+    "baseline_store.py": AGENT_REL / "baseline_store.py",
     **{
         p: Path(p)
         for p in (
@@ -608,10 +610,25 @@ def render_task(root, manifest):
         task = task.replace("{{" + key + "}}", value)
     if re.search(r"\{\{[A-Z_]+\}\}", task):
         fail("unresolved task placeholders")
+    if manifest.get("baseline_mode") == "local":
+        task += """
+
+## Frozen local baseline
+
+The complete reference baseline was prepared before this container started.
+Its evidence at /workspace/artifacts/baseline and anchor at
+/workspace/task/baseline.json are read-only. The trusted evaluator validates
+their identity and runtime compatibility before reuse. Never run a replacement
+baseline, copy receipts into the search ledger, or change baseline evidence.
+If reuse validation fails, report the error and stop; do not simulate a fallback
+reference. Local baseline attempts and time already count toward search budgets.
+"""
     return task
 
 
-def prepare(root, config, runs_root, versions, network):
+def prepare(root, config, runs_root, versions, network, *, baseline_mode=None):
+    if baseline_mode not in (None, "local"):
+        fail("unsupported baseline mode")
     runs_root.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     for suffix in range(10000):
@@ -668,6 +685,8 @@ def prepare(root, config, runs_root, versions, network):
         "input_path_mapping": mapping,
         "runtime_gaps": runtime_gaps(root),
     }
+    if baseline_mode is not None:
+        manifest["baseline_mode"] = baseline_mode
     save(run / "task/manifest.json", manifest)
     (run / "task/AGENTS.md").write_text(render_task(run / "source", manifest))
     save(run / "supervisor.json", {"consumed_wall_seconds": 0, "active": None})
@@ -677,6 +696,8 @@ def prepare(root, config, runs_root, versions, network):
 
 def load_bundle(run):
     manifest = json.loads((run / "task/manifest.json").read_text())
+    if manifest.get("baseline_mode") not in (None, "local"):
+        fail("unsupported frozen baseline mode")
     for folder, field in (("source", "source_sha256"), ("inputs", "inputs_sha256")):
         if inventory(run / folder, mutable=folder == "source") != manifest[field]:
             fail(f"frozen {folder} changed; start a new experiment")
@@ -690,6 +711,112 @@ def load_bundle(run):
     if candidate.exists():
         inventory(candidate)  # Reject symlinks even in the writable subtree.
     return manifest
+
+
+def baseline_command(argv, *, env, cwd):
+    process = None
+
+    def interrupted(number, frame):
+        raise InterruptedError(
+            f"local baseline interrupted by {signal.Signals(number).name}"
+        )
+
+    handlers = {
+        number: signal.signal(number, interrupted)
+        for number in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        process = subprocess.Popen(argv, env=env, cwd=cwd, start_new_session=True)
+        status = process.wait()
+        if status:
+            raise subprocess.CalledProcessError(status, argv)
+    finally:
+        for number in handlers:
+            signal.signal(number, signal.SIG_IGN)
+        try:
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
+        finally:
+            for number, previous in handlers.items():
+                signal.signal(number, previous)
+
+
+def local_baseline(run, manifest):
+    if manifest.get("baseline_mode") != "local":
+        fail(
+            "this frozen run has no local baseline mode; create a new --baseline-only run"
+        )
+    state = json.loads((run / "supervisor.json").read_text())
+    if state.get("active"):
+        fail(
+            "a container is still recorded for this run; local baseline cannot run concurrently"
+        )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"CODEX_API_KEY", "OPENAI_API_KEY"}
+    }
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    resume = shlex.join(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--baseline-only",
+            "--resume",
+            str(run),
+        ]
+    )
+    try:
+        command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys, importlib.metadata; "
+                    'assert sys.version_info[:2] == (3, 14), "local baseline requires project Python 3.14"; '
+                    "import matplotlib, networkx; "
+                    '[importlib.metadata.version(name) for name in ("matplotlib", "networkx")]'
+                ),
+            ],
+            env=env,
+            cwd=run / "source",
+            timeout=30,
+        )
+        baseline_command(
+            [
+                sys.executable,
+                str(run / "source" / EVALUATOR_REL),
+                "--manifest",
+                str(run / "task/manifest.json"),
+                "--prepare-baseline",
+            ],
+            env=env,
+            cwd=run / "source",
+        )
+        import baseline_store
+
+        baseline_store.validate(run, manifest)
+    except OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt:
+        print(
+            f"Local baseline remains incomplete. Run: {run}\nResume: {resume}",
+            file=sys.stderr,
+        )
+        raise
+    print(
+        f"Local baseline ready: {run}\nStart agent with: ./run_rooflang_agent.sh --resume {shlex.quote(str(run))}"
+    )
+    return 0
 
 
 def check_env_file(path):
@@ -756,6 +883,11 @@ def docker_arguments(run, manifest, image_id, env_file):
             f"type=bind,source={source},target={target}"
             + (",readonly" if readonly else ""),
         ]
+    if manifest.get("baseline_mode") == "local":
+        args += [
+            "--mount",
+            f"type=bind,source={run / 'artifacts/baseline'},target=/workspace/artifacts/baseline,readonly",
+        ]
     return [*args, image_id]
 
 
@@ -776,7 +908,7 @@ def stop_container(identifier):
         )
 
 
-def supervise(run, manifest, image_id, env_file):
+def supervise(run, manifest, image_id, env_file, *, baseline=None):
     state_path = run / "supervisor.json"
     state = json.loads(state_path.read_text())
     if state.get("image_id", image_id) != image_id:
@@ -794,9 +926,17 @@ def supervise(run, manifest, image_id, env_file):
         state["consumed_wall_seconds"] += max(0, time.time() - active["started_at"])
         state["active"] = None
         save(state_path, state)
+    baseline_wall = 0
+    if manifest.get("baseline_mode") == "local":
+        if baseline is None:
+            import baseline_store
+
+            baseline = baseline_store.validate(run, manifest)
+        baseline_wall = baseline["accounting"]["wall_seconds"]
     remaining = (
         manifest["experiment"]["search"]["max_wall_seconds"]
         - state["consumed_wall_seconds"]
+        - baseline_wall
     )
     if remaining <= 0:
         fail("search wall-clock budget is exhausted; resume does not reset it")
@@ -1019,6 +1159,11 @@ def main(argv=None):
         metavar="RUN_DIR",
         help="resume the frozen run without resetting its budget",
     )
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="prepare a local baseline without Docker/API; may resume a local baseline run",
+    )
     parser.add_argument("--experiment", type=Path)
     parser.add_argument("--project", type=Path, default=ROOT)
     parser.add_argument("--runs-root", type=Path)
@@ -1043,6 +1188,16 @@ def main(argv=None):
         "--inside-container", action="store_true", help=argparse.SUPPRESS
     )
     args = parser.parse_args(argv)
+    if args.baseline_only and (
+        args.build_only
+        or args.build
+        or args.check
+        or args.prepare_only
+        or args.inside_container
+    ):
+        fail(
+            "--baseline-only only combines with --resume, not build/check/prepare modes"
+        )
     if args.build and (
         args.build_only or args.check or args.prepare_only or args.resume
     ):
@@ -1123,7 +1278,14 @@ def main(argv=None):
                 args.build_proxy,
                 args.build_fallback_proxy,
             )
-        run = prepare(root, config, runs_root, versions, args.network)
+        run = prepare(
+            root,
+            config,
+            runs_root,
+            versions,
+            args.network,
+            baseline_mode="local" if args.baseline_only else None,
+        )
         if args.prepare_only:
             print(
                 "Search remains blocked: " + "; ".join(gaps)
@@ -1140,6 +1302,13 @@ def main(argv=None):
         gaps = runtime_gaps(run / "source")
         if gaps:
             fail("search cannot start: " + "; ".join(gaps))
+        if args.baseline_only:
+            return local_baseline(run, manifest)
+        baseline = None
+        if manifest.get("baseline_mode") == "local":
+            import baseline_store
+
+            baseline = baseline_store.validate(run, manifest)
         if args.env_file is None:
             fail("--env-file is required to start an agent")
         env_file = safe_path(args.env_file)
@@ -1147,7 +1316,7 @@ def main(argv=None):
         image_id = image_identity(
             manifest["experiment"]["agent"]["image"], manifest["build_input_sha256"]
         )
-        return supervise(run, manifest, image_id, env_file)
+        return supervise(run, manifest, image_id, env_file, baseline=baseline)
 
 
 if __name__ == "__main__":
