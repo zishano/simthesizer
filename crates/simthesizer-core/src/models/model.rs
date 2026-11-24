@@ -5,6 +5,9 @@ use crate::types::{Layer, ParallelStrategy};
 
 pub trait Model: Module {
     fn init(&mut self, parallel: ParallelStrategy) -> Result<()>;
+    fn init_with_expert_tp(&mut self, _parallel: ParallelStrategy, _expert_tp: u32) -> Result<()> {
+        anyhow::bail!("model does not support independent expert tensor parallelism")
+    }
     fn weight_bytes_per_device(&self) -> u64;
     fn kv_bytes_per_request_per_device(&self) -> u64 {
         0

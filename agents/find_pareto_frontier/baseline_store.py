@@ -96,6 +96,9 @@ def trial_identity(manifest, environment, candidate, case, rows):
         "model_assumptions": config["model_assumptions"],
         "policy": config["policy"],
     }
+    diagnostics = config.get("artifacts", {}).get("policy_diagnostics")
+    if diagnostics is not None:
+        group["policy_diagnostics"] = diagnostics
     return identity({"group": group, "candidate": candidate}), identity(group)
 
 

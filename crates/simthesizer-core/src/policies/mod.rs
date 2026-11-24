@@ -10,8 +10,20 @@ use serde::{Deserialize, Serialize};
 use crate::types::{InstanceLoad, NodeID};
 
 pub mod candidate;
+mod environment;
+pub use environment::EnvironmentObservation;
+
+#[cfg(test)]
+#[path = "../../../../examples/policies/adaptive.rs"]
+mod adaptive_example;
+
+#[cfg(test)]
+#[path = "../../../../examples/policies/composable.rs"]
+mod composable_example;
 
 pub const API_VERSION: &str = "serving-policy-v1";
+pub const OBSERVATION_FEATURE: &str = "causal-environment-v1";
+pub const DIAGNOSTIC_FEATURE: &str = "bounded-policy-samples-v1";
 pub type SharedPolicy = Rc<RefCell<PolicyRuntime>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -69,10 +81,26 @@ pub struct PolicyConfig {
     pub seed: u64,
     pub limits: PolicyLimits,
     pub slo: PolicySlo,
+    #[serde(default)]
+    pub diagnostics: Option<PolicyDiagnostics>,
+}
+
+/// Optional bounded samples, independent of full execution-history capture.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDiagnostics {
+    pub max_samples: usize,
+    pub every_decisions: u64,
 }
 
 impl PolicyConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(diagnostics) = &self.diagnostics {
+            ensure!(
+                (1..=128).contains(&diagnostics.max_samples) && diagnostics.every_decisions > 0,
+                "policy diagnostics require 1..=128 samples and a positive decision interval"
+            );
+        }
         for [lo, hi] in [
             self.limits.p_token_budget_bounds,
             self.limits.d_token_budget_bounds,
@@ -127,6 +155,7 @@ pub struct RouteObservation<'a> {
     pub input_tokens: u32,
     pub prefill: &'a [InstanceLoad],
     pub decode: &'a [InstanceLoad],
+    pub environment: Option<EnvironmentObservation<'a>>,
 }
 
 pub struct BatchObservation<'a> {
@@ -136,6 +165,7 @@ pub struct BatchObservation<'a> {
     pub default_token_budget: u32,
     pub default_max_batch: usize,
     pub memory_limit_bytes: Option<u64>,
+    pub environment: Option<EnvironmentObservation<'a>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +185,19 @@ pub struct KvObservation<'a> {
     pub now: f64,
     pub pending: &'a [PendingKv],
     pub inflight: usize,
+    pub environment: Option<EnvironmentObservation<'a>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicySample {
+    pub decision: u64,
+    pub kind: &'static str,
+    pub time_s: f64,
+    pub pressure: Vec<crate::resources::ResourcePressure>,
+    pub memory: Vec<crate::resources::MemoryUsage>,
+    pub registered_read_count: usize,
+    /// At most 64 read requirements per sample; count above retains total coverage.
+    pub registered_reads: Vec<crate::kv::KvReadRequirement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -201,6 +244,8 @@ pub struct PolicyStatistics {
     pub waits: u64,
     pub decision_wall_seconds: f64,
     pub simulation_end_s: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<PolicySample>,
 }
 
 type RouteFn = fn(&RouteObservation<'_>, &PolicyContext<'_>, &mut [u8]) -> RouteAction;
@@ -255,6 +300,39 @@ impl PolicyRuntime {
         self.statistics.route_decisions += 1;
     }
 
+    fn sample(
+        &mut self,
+        kind: &'static str,
+        now: f64,
+        environment: Option<EnvironmentObservation<'_>>,
+    ) {
+        let Some(config) = &self.config.diagnostics else {
+            return;
+        };
+        if self.statistics.samples.len() >= config.max_samples {
+            return;
+        }
+        let decision = self.statistics.route_decisions
+            + self.statistics.batch_decisions
+            + self.statistics.kv_decisions;
+        if !decision.is_multiple_of(config.every_decisions) {
+            return;
+        }
+        let Some(environment) = environment else {
+            return;
+        };
+        let (registered_read_count, reads) = environment.registered_read_sample(64);
+        self.statistics.samples.push(PolicySample {
+            decision,
+            kind,
+            time_s: now,
+            pressure: environment.pressure(),
+            memory: environment.memory(),
+            registered_read_count,
+            registered_reads: reads,
+        });
+    }
+
     pub fn route(&mut self, observation: &RouteObservation<'_>) -> Result<RouteAction> {
         ensure!(
             observation.now.is_finite()
@@ -262,6 +340,7 @@ impl PolicyRuntime {
                 && !observation.decode.is_empty(),
             "route requires current time and nonempty P/D pools"
         );
+        self.sample("route", observation.now, observation.environment);
         let started = Instant::now();
         let context = PolicyContext {
             config: &self.config,
@@ -278,6 +357,7 @@ impl PolicyRuntime {
     }
 
     pub fn batch(&mut self, observation: &BatchObservation<'_>) -> Result<BatchAction> {
+        self.sample("batch", observation.now, observation.environment);
         let started = Instant::now();
         let context = PolicyContext {
             config: &self.config,
@@ -341,6 +421,7 @@ impl PolicyRuntime {
     }
 
     pub fn kv(&mut self, observation: &KvObservation<'_>) -> Result<KvAction> {
+        self.sample("kv", observation.now, observation.environment);
         let started = Instant::now();
         let context = PolicyContext {
             config: &self.config,
@@ -454,6 +535,7 @@ impl PolicyRuntime {
 #[cfg(test)]
 pub(crate) fn test_config() -> PolicyConfig {
     PolicyConfig {
+        diagnostics: None,
         kind: PolicyKind::Candidate,
         seed: 0,
         limits: PolicyLimits {
@@ -494,6 +576,7 @@ mod tests {
 
     fn observation(requests: &[QueuedRequest]) -> BatchObservation<'_> {
         BatchObservation {
+            environment: None,
             now: 1.0,
             instance: InstanceId {
                 stage: Stage::Prefill,
@@ -650,6 +733,7 @@ mod tests {
         };
         assert!(policy
             .kv(&KvObservation {
+                environment: None,
                 now: 1.0,
                 pending: &pending,
                 inflight: 0
@@ -657,6 +741,7 @@ mod tests {
             .is_err());
         assert!(policy
             .kv(&KvObservation {
+                environment: None,
                 now: 1.0,
                 pending: &pending,
                 inflight: 1
@@ -668,6 +753,7 @@ mod tests {
         };
         assert!(policy
             .kv(&KvObservation {
+                environment: None,
                 now: 1.0,
                 pending: &pending,
                 inflight: 0
@@ -679,6 +765,7 @@ mod tests {
         };
         assert!(policy
             .kv(&KvObservation {
+                environment: None,
                 now: 1.0,
                 pending: &pending,
                 inflight: 0
@@ -699,6 +786,7 @@ mod tests {
         }
         let loads = [InstanceLoad::default(); 2];
         let observation = RouteObservation {
+            environment: None,
             now: 0.0,
             request_id: 0,
             input_tokens: 4,
@@ -712,5 +800,160 @@ mod tests {
             assert_eq!(runtime.route(&observation).unwrap().prefill, 0);
             assert_eq!(runtime.route(&observation).unwrap().prefill, 1);
         }
+    }
+
+    #[test]
+    fn diagnostic_samples_are_opt_in_bounded_and_do_not_change_actions() {
+        let resources = crate::resources::Resources::default();
+        let kv = crate::kv::KvRuntime::default();
+        let queue = queue();
+        let mut input = observation(&queue);
+        input.environment = Some(EnvironmentObservation::new(&resources, &kv));
+        let mut plain = PolicyRuntime::new(test_config()).unwrap();
+        let mut config = test_config();
+        config.diagnostics = Some(PolicyDiagnostics {
+            max_samples: 2,
+            every_decisions: 3,
+        });
+        let mut observed = PolicyRuntime::new(config).unwrap();
+        for _ in 0..10 {
+            assert_eq!(
+                plain.batch(&input).unwrap(),
+                observed.batch(&input).unwrap()
+            );
+        }
+        assert!(plain.statistics.samples.is_empty());
+        assert!(serde_json::to_value(plain.statistics())
+            .unwrap()
+            .get("samples")
+            .is_none());
+        assert_eq!(observed.statistics.samples.len(), 2);
+        assert_eq!(observed.statistics.samples[0].decision, 0);
+        assert_eq!(observed.statistics.samples[1].decision, 3);
+        assert_eq!(observed.statistics.samples[0].kind, "batch");
+        assert_eq!(observed.statistics.samples[0].time_s, 1.0);
+        assert!(observed.statistics.samples[0].pressure.is_empty());
+    }
+
+    #[test]
+    fn old_configuration_remains_valid_and_bad_diagnostics_fail() {
+        let mut value = serde_json::to_value(test_config()).unwrap();
+        value.as_object_mut().unwrap().remove("diagnostics");
+        let config: PolicyConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(config.diagnostics.is_none());
+        config.validate().unwrap();
+        for (max_samples, every_decisions) in [(0, 1), (129, 1), (1, 0)] {
+            value["diagnostics"] = serde_json::json!({
+                "max_samples": max_samples, "every_decisions": every_decisions
+            });
+            let config: PolicyConfig = serde_json::from_value(value.clone()).unwrap();
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn adaptive_seed_uses_queue_age_and_changes_chunk_budget() {
+        let mut runtime = PolicyRuntime::new(test_config()).unwrap();
+        runtime.batch_fn = adaptive_example::batch;
+        let mut queue = queue();
+        queue[0].last_token_time = Some(0.9);
+        queue[1].last_token_time = Some(0.5);
+        queue[2].last_token_time = Some(0.7);
+        let BatchAction::Run(busy) = runtime.batch(&observation(&queue)).unwrap() else {
+            panic!("expected runnable batch")
+        };
+        assert_eq!(busy.token_budget, 8);
+        assert_eq!(
+            busy.items
+                .iter()
+                .map(|i| i.completion_node_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        let BatchAction::Run(quiet) = runtime.batch(&observation(&queue[..1])).unwrap() else {
+            panic!("expected runnable batch")
+        };
+        assert_eq!(quiet.token_budget, 16);
+    }
+
+    #[test]
+    fn adaptive_seed_consumes_causal_fabric_pressure() {
+        use crate::resources::{Demand, Resources, Work};
+        let mut resources = Resources::default();
+        let kv = crate::kv::KvRuntime::default();
+        let pending: Vec<_> = (0..2)
+            .map(|id| PendingKv {
+                id,
+                request_id: id,
+                layer: 0,
+                source_rank: 0,
+                target_rank: 0,
+                token_start: 0,
+                token_end: 4,
+                bytes: 16,
+                produced_at: 0.0,
+            })
+            .collect();
+        let mut runtime = PolicyRuntime::new(test_config()).unwrap();
+        runtime.kv_fn = adaptive_example::kv;
+        let idle = runtime
+            .kv(&KvObservation {
+                now: 0.0,
+                pending: &pending,
+                inflight: 0,
+                environment: Some(EnvironmentObservation::new(&resources, &kv)),
+            })
+            .unwrap();
+        assert_eq!(idle.submissions, vec![0, 1]);
+        resources
+            .submit(
+                1,
+                Work {
+                    demands: vec![Demand {
+                        resources: [("fabric:link".into(), 1.0)].into(),
+                        latency: 0.0,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        resources.admit(0.0).unwrap();
+        let busy = runtime
+            .kv(&KvObservation {
+                now: 0.0,
+                pending: &pending,
+                inflight: 0,
+                environment: Some(EnvironmentObservation::new(&resources, &kv)),
+            })
+            .unwrap();
+        assert_eq!(busy.submissions, vec![0]);
+    }
+
+    #[test]
+    fn adaptive_seed_routes_by_current_pool_load() {
+        let mut runtime = PolicyRuntime::new(test_config()).unwrap();
+        runtime.route_fn = adaptive_example::route;
+        let loads = [
+            InstanceLoad {
+                waiting_tokens: 8,
+                ..Default::default()
+            },
+            InstanceLoad::default(),
+        ];
+        let input = RouteObservation {
+            now: 1.0,
+            request_id: 0,
+            input_tokens: 4,
+            prefill: &loads,
+            decode: &loads,
+            environment: None,
+        };
+        assert_eq!(
+            runtime.route(&input).unwrap(),
+            RouteAction {
+                prefill: 1,
+                decode: 1
+            }
+        );
     }
 }

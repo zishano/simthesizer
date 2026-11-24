@@ -351,6 +351,9 @@ impl Scheduler for ChunkedPrefillScheduler {
             bail!("shared Rooflang KV does not yet support prefix caching");
         }
         self.shared_memory = true;
+        // A shared runner schedules one synchronized group, with one group budget.
+        self.effective_max_batch = self.max_batch;
+        self.effective_max_num_batched_tokens = self.max_num_batched_tokens;
         Ok(())
     }
     fn memory_limit(&self) -> Option<u64> {
@@ -696,6 +699,56 @@ mod tests {
         scheduler.schedule().unwrap();
         scheduler.done_iteration(3.0);
         state(&scheduler, 0, 0, 2);
+    }
+
+    #[test]
+    fn shared_ep_uses_group_batch_and_token_budgets_without_changing_legacy_ep() {
+        for ep in [1, 8] {
+            for shared in [false, true] {
+                for (input, budget, max_batch, expected_tokens, expected_batch) in [
+                    (
+                        20,
+                        3,
+                        2,
+                        if shared { 3 } else { 3 * ep },
+                        if shared || ep == 1 { 1 } else { 2 },
+                    ),
+                    (
+                        1,
+                        100,
+                        2,
+                        if shared { 2 } else { 2 * ep },
+                        if shared { 2 } else { 2 * ep },
+                    ),
+                ] {
+                    let mut scheduler = scheduler(budget, false);
+                    scheduler.max_batch = max_batch;
+                    scheduler
+                        .init(0, 0, 1, ParallelStrategy { tp: 1, pp: 1, ep })
+                        .unwrap();
+                    if shared {
+                        scheduler.use_shared_memory().unwrap();
+                    }
+                    for id in 0..20 {
+                        let mut item = request(input, 1);
+                        item.request_id = id;
+                        item.completion_node_id = id;
+                        scheduler.enqueue_sub_request(item);
+                    }
+                    let batch = scheduler.schedule().unwrap();
+                    assert_eq!(
+                        batch.iter().map(|b| b.q_len).sum::<u32>(),
+                        expected_tokens,
+                        "ep={ep}, shared={shared}"
+                    );
+                    assert_eq!(
+                        batch.len(),
+                        expected_batch as usize,
+                        "ep={ep}, shared={shared}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

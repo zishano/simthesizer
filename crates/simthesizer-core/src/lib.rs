@@ -12,6 +12,7 @@ pub mod routers;
 pub mod schedulers;
 pub mod systems;
 pub mod types;
+pub mod wall_profile;
 
 pub use compute_sims::compute_sim;
 pub use compute_sims::ComputeSimulator;

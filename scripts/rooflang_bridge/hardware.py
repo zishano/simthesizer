@@ -4,13 +4,14 @@ import math
 
 from rooflang.language.graph import FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
-from rooflang_bridge.topology import build_topology, MODELS
 from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.h200 import H200Cluster
 from rooflang.programs.presets.rtx6000d import RTX6000DCluster
 
+from rooflang_bridge.topology import MODELS, build_topology
 
-def build_hardware(config, tp):
+
+def build_hardware(config, tp, *, collective=True):
     if "gpu_model" not in config:
         # Retained for old audit replay and diagnostic sensitivity tests only.
         hw, gpu, mem = _synthetic(config, tp)
@@ -31,7 +32,12 @@ def build_hardware(config, tp):
         gpu = [names[name] for name in ids]
         if any(hw.models[d] != config["gpu_model"] for d in gpu):
             raise ValueError("allocated GPU model mismatch")
-        hw.find_aggregate_bandwidth(gpu)
+        if collective:
+            hw.find_aggregate_bandwidth(gpu)
+        else:
+            for source in gpu:
+                for target in gpu:
+                    hw.find_fabric_path_directed(source, target)
         mem = [hw.find_local_memory(d) for d in gpu]
         return (
             hw,

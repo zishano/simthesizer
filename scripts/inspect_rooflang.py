@@ -14,11 +14,12 @@ from pathlib import Path
 from results import load_run, summarize_run
 from rooflang_bridge.configuration import pd_config, toml_document, topology_pd_config
 from rooflang_bridge.pd_report import export_transfers
+from rooflang_bridge.wall_report import WallReport
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(command, log):
+def run(command, log, wall_report=None):
     print(f"运行：{' '.join(map(str, command))}", flush=True)
     started = time.perf_counter()
     shown = False
@@ -40,6 +41,8 @@ def run(command, log):
                 if line.startswith("SIMTHESIZER_PROGRESS "):
                     stream.flush()
                     progress = json.loads(line.removeprefix("SIMTHESIZER_PROGRESS "))
+                    if wall_report is not None:
+                        wall_report.observe(progress)
                     completed, total = progress["completed"], progress["total"]
                     percent = completed * 100 // total if total else 100
                     filled = completed * 30 // total if total else 30
@@ -49,6 +52,8 @@ def run(command, log):
                         f" | 已用 {time.perf_counter() - started:.1f}s"
                         f" | 仿真时间 {progress['time_s']:.3f}s"
                     )
+                    if wall_report is not None:
+                        message += wall_report.live_summary()
                     print(
                         ("\r" if tty else "") + message,
                         end="" if tty else "\n",
@@ -63,7 +68,7 @@ def run(command, log):
         raise RuntimeError(f"命令失败，日志：{log}\n{log.read_text()[-4000:]}")
 
 
-def main():
+def inspect(wall_report, invocation_started):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workload", type=Path, help="默认：输入 5 / 输出 3 tokens 的小请求"
@@ -72,7 +77,18 @@ def main():
     parser.add_argument(
         "--gpu-model", choices=["rtx6000d", "h200", "b300"], default="rtx6000d"
     )
-    parser.add_argument("--tp", type=int, choices=[1, 2, 4, 8], default=2)
+    parser.add_argument(
+        "--model", choices=["llama3_1_8b", "qwen3_235b_a22b"], default="llama3_1_8b"
+    )
+    parser.add_argument(
+        "--routing-seed", type=int, default=0, help="Qwen3 专家路由的确定性随机种子"
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        choices=[1, 2, 4, 8],
+        help="Llama 默认 2；Qwen3 Attention TP 支持 1/2/4",
+    )
     parser.add_argument("--pd", action="store_true", help="独立 GPU 的 P/D 实例池")
     parser.add_argument(
         "--execution",
@@ -86,8 +102,12 @@ def main():
         action="store_true",
         help="shared 模式允许显式 GPU IDs 重叠，独立实例权重分别占内存",
     )
-    parser.add_argument("--prefill-instances", type=int, default=1)
-    parser.add_argument("--decode-instances", type=int, default=1)
+    parser.add_argument(
+        "--prefill-instances", type=int, default=1, help="Prefill 完整模型副本数"
+    )
+    parser.add_argument(
+        "--decode-instances", type=int, default=1, help="Decode 完整模型副本数"
+    )
     parser.add_argument(
         "--kv-link-bw",
         type=float,
@@ -102,19 +122,32 @@ def main():
     for side in ("prefill", "decode"):
         parser.add_argument(f"--{side}-gpu-model", choices=["rtx6000d", "h200", "b300"])
         parser.add_argument(
-            f"--{side}-gpu-count", type=int, help="整个池的 GPU 数，须等于实例数 × TP"
+            f"--{side}-gpu-count",
+            type=int,
+            help="整个池的 GPU 数：实例数 × 组宽度（Llama TP / Qwen EP）",
         )
         parser.add_argument(
             f"--{side}-gpu-ids",
             nargs="+",
-            help="硬件图中的 GPU 名字，按实例和 TP rank 排列",
+            help="硬件图中的 GPU 名字，按实例和组内 rank 排列",
         )
         parser.add_argument(f"--{side}-tp", type=int, choices=[1, 2, 4, 8])
+        parser.add_argument(
+            f"--{side}-expert-tp",
+            type=int,
+            choices=[1],
+            default=1,
+            help="专家内部 TP；当前固定 1，独立于 Attention TP",
+        )
         parser.add_argument(
             f"--{side}-pp", type=int, choices=[1], default=1, help="当前仅支持 PP=1"
         )
         parser.add_argument(
-            f"--{side}-ep", type=int, choices=[1], default=1, help="当前仅支持 EP=1"
+            f"--{side}-ep",
+            type=int,
+            choices=[1, 2, 4, 8],
+            default=1,
+            help="Qwen3 支持 EP=1/2/4/8；Llama 仅支持 1",
         )
         parser.add_argument(f"--{side}-max-batch", type=int)
         parser.add_argument(f"--{side}-token-budget", type=int)
@@ -127,6 +160,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="额外保存历史事件、轮次审计和 CSV；默认保存指标、指标图与运行配置",
+    )
+    parser.add_argument(
+        "--wall-profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="累计主机实际耗时，输出分阶段表格；无需开启历史报告",
     )
     parser.add_argument(
         "--full-graphs",
@@ -148,6 +187,29 @@ def main():
         "--reference", type=Path, help="可选：匹配工作负载的真实结果 JSONL"
     )
     args = parser.parse_args()
+    qwen = args.model == "qwen3_235b_a22b"
+    args.tp = args.tp or (1 if qwen else 2)
+    model_title = "Qwen3-235B-A22B" if qwen else "Llama 3.1 8B"
+    if qwen:
+        if not args.pd or args.execution != "shared" or args.model_entry != "rust":
+            parser.error("Qwen3 需要 --pd --execution shared --model-entry rust")
+        if any(
+            tp not in (1, 2, 4)
+            for tp in (args.tp, args.prefill_tp or args.tp, args.decode_tp or args.tp)
+        ):
+            parser.error("Qwen3 Attention TP 只支持 1/2/4；专家内部 TP 固定 1")
+        for side in ("prefill", "decode"):
+            tp = getattr(args, f"{side}_tp") or args.tp
+            if getattr(args, f"{side}_ep") % tp:
+                parser.error(f"Qwen3 {side} EP 必须能被 Attention TP 整除")
+        if args.reference_every_round:
+            parser.error(
+                "Qwen3 共享图不支持 --reference-every-round 独占预演；可使用 --reports 检查原生执行"
+            )
+        if not 0 <= args.routing_seed < 2**64:
+            parser.error("--routing-seed 必须是 uint64")
+    elif args.prefill_ep != 1 or args.decode_ep != 1 or args.routing_seed != 0:
+        parser.error("EP>1 和 --routing-seed 仅适用于 Qwen3")
     reports = args.reports or args.full_graphs
     if args.prefill_instances < 1 or args.decode_instances < 1:
         parser.error("P/D 实例数必须为正整数")
@@ -215,6 +277,8 @@ def main():
                 break
             except FileExistsError:
                 suffix += 1
+    if args.wall_profile:
+        wall_report.enable(output, started=invocation_started)
     print(f"输出目录：{output}", flush=True)
     if workload is None:
         workload = output / "workload.jsonl"
@@ -276,6 +340,11 @@ def main():
     instances = [("", output / "audit", output)]
     if args.pd:
         leaf = tomllib.loads(config)["system"]
+        if qwen:
+            leaf["model"] = {"kind": "qwen3_235b_a22b"}
+            leaf["model_runner"].update(
+                graph_model="qwen3_235b_a22b", routing_seed=args.routing_seed
+            )
         if manual_link:
             document, instances = pd_config(
                 leaf,
@@ -294,6 +363,7 @@ def main():
                     "tp": getattr(args, f"{side}_tp") or args.tp,
                     "pp": getattr(args, f"{side}_pp"),
                     "ep": getattr(args, f"{side}_ep"),
+                    "expert_tp": getattr(args, f"{side}_expert_tp"),
                 }
                 for argument, key in [
                     ("gpu_count", "gpu_count"),
@@ -347,8 +417,12 @@ def main():
             "--output-engine-trace",
             str(output / "state.jsonl"),
         ]
-    run(command, output / "simulation.log")
+    if args.wall_profile:
+        command += ["--output-wall-profile", str(output / "wall-profile-native.json")]
+    wall_report.phase("simulation")
+    run(command, output / "simulation.log", wall_report)
     wall = time.perf_counter() - started
+    wall_report.phase("metrics")
     print("请求仿真完成，正在汇总指标……", flush=True)
     metrics = summarize_run(load_run(str(output / "result.jsonl")))
     (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -372,13 +446,19 @@ def main():
             output / (tag + name + ".log"),
         )
 
+    wall_report.phase("plots")
     script("draw.py", output / "result.jsonl", "--output", output / "metrics.png")
     script(
-        "draw_throughput.py", output / "result.jsonl", "--output", output / "throughput.png",
-        "--title", "P/D service throughput" if args.pd else "Service throughput",
+        "draw_throughput.py",
+        output / "result.jsonl",
+        "--output",
+        output / "throughput.png",
+        "--title",
+        "P/D service throughput" if args.pd else "Service throughput",
     )
     if not reports:
         if reference:
+            wall_report.phase("reports")
             script(
                 "compare.py",
                 f"real={reference}",
@@ -391,6 +471,7 @@ def main():
             flush=True,
         )
         return
+    wall_report.phase("reports")
     graphs = args.full_graphs
     instance_links = []
     kv_report = ""
@@ -505,15 +586,23 @@ def main():
         for name, m in metrics.items()
     )
     anchors = "".join(f'<li><a href="{path}">{label}</a></li>' for path, label in links)
+    if args.wall_profile:
+        anchors += '<li><a href="wall-profile.txt">主机实际耗时分解</a> · <a href="wall-profile.csv">CSV</a> · <a href="wall-profile.json">JSON</a></li>'
     deployment = f"{args.gpu_model}，单实例 TP={args.tp}"
     if args.pd:
         descriptions = []
         for side, title in [("prefill_instances", "P"), ("decode_instances", "D")]:
             leaves = document["system"][side]
             runner, scheduler = leaves[0]["model_runner"], leaves[0]["scheduler"]
+            parallel = (
+                f"Attention TP={runner['tp']}，专家 TP=1，EP={runner['ep']}，"
+                f"每副本 {len(runner['attention_groups'])} 个 Attention 组"
+                if qwen
+                else f"TP={runner['tp']}，PP=1，EP=1"
+            )
             descriptions.append(
-                f"{title}：{runner['hardware']['gpu_model']}，{len(leaves)} 个实例，"
-                f"TP={runner['tp']}，PP=1，EP=1，共 {len(leaves) * runner['tp']} 张 GPU，"
+                f"{title}：{runner['hardware']['gpu_model']}，{len(leaves)} 个完整副本，"
+                f"{parallel}，共 {len(leaves) * runner['hardware']['gpu_count']} 张 GPU，"
                 f"max_batch={scheduler['max_batch']}，token_budget={scheduler['max_num_batched_tokens']}"
             )
         deployment = "；".join(descriptions)
@@ -527,13 +616,27 @@ def main():
     ).write_text(f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>Rooflang 仿真观测</title><style>body{{font:16px sans-serif;max-width:1100px;margin:40px auto;padding:20px}}
 td,th{{padding:8px 16px;text-align:left;border-bottom:1px solid #ddd}}img{{max-width:100%}}li{{margin:10px}}</style></head><body>
-<h1>Llama 3.1 8B 仿真观测</h1><p>{deployment} 模型入口：{args.model_entry}</p>
+<h1>{model_title} 仿真观测</h1><p>{deployment} 模型入口：{args.model_entry}</p>
 <p>指标为仿真预测。模拟时间与程序现实耗时不同。{"共享模式直接记录原生算子与 KV 事件；详细时间线采用全局时钟。KV 交接模式：" + args.kv_handoff if args.execution == "shared" else "内层图通过批次重建并核对审计耗时；原始时间线位于 audit。"}</p>
 <p>仿真命令现实耗时（含 Cargo 启动/构建，不含后续分析）：{wall:.3f} 秒。</p>
 <p>{"已生成全部轮次图。" if graphs else "未生成大型 HTML 图；使用 --full-graphs 可启用。原始外层事件已保存。"}</p>
 <ul>{anchors}</ul>{kv_report}<table><tr><th>指标</th><th>均值 / 整体值</th><th>单位</th></tr>{rows}</table>
 <img src="metrics.png" alt="延迟与吞吐量图"><p>{"共享模式检查依赖、资源、KV 生命周期一致性；TP 与 KV 使用相同物理链路及 HBM 资源。" if args.execution == "shared" else "时间检查仅验证当前独占资源后端的一致性；KV 共享链路竞争不包含算子内部 TP 通信。"}这些检查不验证真实硬件精度。</p></body></html>""")
     print(f"\n完成。浏览器打开：{output / 'index.html'}", flush=True)
+
+
+def main():
+    wall_report = WallReport()
+    try:
+        inspect(wall_report, time.perf_counter())
+    except BaseException:
+        try:
+            wall_report.finish(False)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"耗时报告保存失败：{error}", file=sys.stderr)
+        raise
+    else:
+        wall_report.finish(True)
 
 
 if __name__ == "__main__":

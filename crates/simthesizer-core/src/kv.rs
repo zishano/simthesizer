@@ -131,6 +131,18 @@ struct PendingTransfer {
     route: Route,
 }
 
+/// An unmet read registered by an expanded batch, not necessarily its next
+/// executable layer or a current critical-path stall.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KvReadRequirement {
+    pub request_id: u64,
+    pub layer: u32,
+    pub target_rank: usize,
+    pub required_tokens: u32,
+    /// Contiguous prefix present for every KV head of the target rank.
+    pub ready_tokens: u32,
+}
+
 #[derive(Default)]
 pub struct KvRuntime {
     pub plans: BTreeMap<u64, Plan>,
@@ -144,6 +156,43 @@ pub struct KvRuntime {
 }
 
 impl KvRuntime {
+    /// Read only registered requirements; do not predict future decode work.
+    pub fn policy_reads(&self) -> Vec<KvReadRequirement> {
+        self.policy_read_requirements().collect()
+    }
+
+    /// Count all registered unmet reads while allocating only the requested prefix.
+    pub fn policy_read_sample(&self, limit: usize) -> (usize, Vec<KvReadRequirement>) {
+        let mut total = 0;
+        let mut reads = Vec::new();
+        for read in self.policy_read_requirements() {
+            total += 1;
+            if reads.len() < limit {
+                reads.push(read);
+            }
+        }
+        (total, reads)
+    }
+
+    fn policy_read_requirements(&self) -> impl Iterator<Item = KvReadRequirement> + '_ {
+        self.requests.iter().flat_map(move |(&request_id, state)| {
+            state.gates.iter().flat_map(move |(&(layer, rank), gates)| {
+                let ready_tokens = self.ready_tokens(request_id, false, layer, rank);
+                gates
+                    .keys()
+                    .copied()
+                    .filter(move |&required_tokens| required_tokens > ready_tokens)
+                    .map(move |required_tokens| KvReadRequirement {
+                        request_id,
+                        layer,
+                        target_rank: rank,
+                        required_tokens,
+                        ready_tokens,
+                    })
+            })
+        })
+    }
+
     pub fn configure_policy(&mut self, policy: SharedPolicy) -> Result<()> {
         // The reference keeps the existing eager transfer path.
         if !policy.borrow().is_reference() {
@@ -233,6 +282,10 @@ impl KvRuntime {
             now: graph.now(),
             pending: &pending,
             inflight: self.inflight,
+            environment: Some(crate::policies::EnvironmentObservation::new(
+                &graph.resources,
+                self,
+            )),
         })?;
         for id in action.submissions {
             let transfer = self
@@ -483,7 +536,10 @@ impl KvRuntime {
                 tokens,
             } => {
                 let end = self.ready_tokens(request, prefill, layer, rank);
-                ensure!(end >= tokens, "KV not ready: request {request} layer {layer} rank {rank}, need {tokens}, have {end}");
+                ensure!(
+                    end >= tokens,
+                    "KV not ready: request {request} layer {layer} rank {rank}, need {tokens}, have {end}"
+                );
             }
             Event::Produce {
                 request,
@@ -541,8 +597,10 @@ impl KvRuntime {
                         );
                         previous.token_end = end;
                         previous.bytes += block.bytes;
-                        let extended = previous.clone();
-                        self.emit(graph, "extend", &extended);
+                        if graph.tracing_enabled() {
+                            let extended = previous.clone();
+                            self.emit(graph, "extend", &extended);
+                        }
                     } else {
                         appends.insert((layer, rank), block.clone());
                         self.emit(graph, "produce", &block);
@@ -742,6 +800,7 @@ mod tests {
             PolicyRuntime::new(PolicyConfig {
                 kind: PolicyKind::Candidate,
                 seed: 0,
+                diagnostics: None,
                 limits: PolicyLimits {
                     p_token_budget_bounds: [1, 128],
                     d_token_budget_bounds: [1, 32],
@@ -804,6 +863,16 @@ mod tests {
         assert_eq!(kv.inflight, 1);
         assert!(kv.requests[&7].sources.values().all(|b| b.refs == 1));
         assert_eq!(kv.ready_tokens(7, false, 0, 0), 0);
+        assert_eq!(
+            kv.policy_reads(),
+            vec![KvReadRequirement {
+                request_id: 7,
+                layer: 0,
+                target_rank: 0,
+                required_tokens: 20,
+                ready_tokens: 0,
+            }]
+        );
         for index in 0..2 {
             let b = kv.requests[&7]
                 .received
@@ -826,6 +895,7 @@ mod tests {
                 assert_eq!(kv.ready_tokens(7, false, 0, 0), 0);
                 assert_eq!(kv.read_gate(7, 0, 0, 20), Some(gate));
                 assert_eq!(kv.requests[&7].sources.len(), 1);
+                assert_eq!(kv.policy_reads()[0].ready_tokens, 0);
             }
         }
         assert_eq!(kv.ready_tokens(7, false, 0, 0), 20);
@@ -833,6 +903,91 @@ mod tests {
         assert!(kv.pending.is_empty());
         assert!(kv.requests[&7].sources.is_empty());
         assert_eq!(kv.inflight, 0);
+        assert!(kv.policy_reads().is_empty());
+    }
+
+    #[test]
+    fn policy_reads_preserve_gaps_and_include_only_registered_requirements() {
+        let mut kv = runtime();
+        let mut graph = Graph::new();
+        let mut block = Block {
+            id: 0,
+            source: Some(0),
+            request: 7,
+            prefill: false,
+            layer: 0,
+            token_start: 0,
+            token_end: 2,
+            head_start: 0,
+            head_end: 4,
+            device: "d0".into(),
+            state: "ready",
+            refs: 1,
+            bytes: 128,
+            produced_at: 0.0,
+        };
+        kv.mark_ready(&block);
+        block.token_start = 4;
+        block.token_end = 6;
+        kv.mark_ready(&block);
+        // Neither known request length nor incomplete KV creates a requirement.
+        assert!(kv.policy_reads().is_empty());
+        let gate = graph.add_condition();
+        kv.register_read_gate(7, 0, 0, 6, gate);
+        let later = graph.add_condition();
+        kv.register_read_gate(7, 1, 0, 6, later);
+        let expected = vec![
+            KvReadRequirement {
+                request_id: 7,
+                layer: 0,
+                target_rank: 0,
+                required_tokens: 6,
+                ready_tokens: 2,
+            },
+            KvReadRequirement {
+                request_id: 7,
+                layer: 1,
+                target_rank: 0,
+                required_tokens: 6,
+                ready_tokens: 0,
+            },
+        ];
+        for _ in 0..3 {
+            assert_eq!(kv.policy_reads(), expected);
+            assert_eq!(kv.read_gate(7, 0, 0, 6), Some(gate));
+            assert_eq!(kv.ready_tokens(7, false, 0, 0), 2);
+        }
+        block.token_start = 2;
+        block.token_end = 4;
+        kv.mark_ready(&block);
+        // Sampling never releases the gate itself; the ACK owner does that.
+        assert_eq!(kv.policy_reads(), expected[1..]);
+        assert_eq!(kv.read_gate(7, 0, 0, 6), Some(gate));
+        let cause = graph.add_resource_node(Work::default());
+        kv.release_read_gates(7, 0, 0, cause, &mut graph).unwrap();
+        assert_eq!(kv.read_gate(7, 0, 0, 6), None);
+        assert_eq!(kv.read_gate(7, 1, 0, 6), Some(later));
+        assert_eq!(kv.policy_reads(), expected[1..]);
+    }
+
+    #[test]
+    fn policy_read_sample_retains_only_its_bound_and_counts_all_requirements() {
+        let mut kv = runtime();
+        let mut graph = Graph::new();
+        for tokens in 1..=100 {
+            kv.register_read_gate(7, 0, 0, tokens, graph.add_condition());
+        }
+        let (total, reads) = kv.policy_read_sample(64);
+        assert_eq!(total, 100);
+        assert_eq!(reads.len(), 64);
+        assert!(reads.capacity() <= 64);
+        assert_eq!(reads[0].required_tokens, 1);
+        assert_eq!(reads[63].required_tokens, 64);
+        assert_eq!(reads, kv.policy_reads()[..64]);
+        let (total, none) = kv.policy_read_sample(0);
+        assert_eq!(total, 100);
+        assert_eq!(none.capacity(), 0);
+        assert_eq!(kv.requests[&7].gates[&(0, 0)].len(), 100);
     }
 
     #[test]

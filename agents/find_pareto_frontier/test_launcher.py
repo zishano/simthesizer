@@ -86,6 +86,10 @@ class LauncherTests(unittest.TestCase):
         self.root.mkdir()
         for relative in launcher.BUILD_FILES.values():
             self.write(relative, "fixture\n")
+        self.write("Cargo.toml", '[workspace]\nmembers = []\nresolver = "2"\n')
+        self.local_image = self.enterContext(
+            patch.object(launcher, "local_image", return_value=None)
+        )
         self.write(
             launcher.AGENT_REL / "AGENTS.md.template",
             "Manifest {{MANIFEST_SHA256}}\nPolicy {{POLICY_DIRECTORY}}\n",
@@ -113,6 +117,174 @@ class LauncherTests(unittest.TestCase):
                 "bridge",
                 baseline_mode=baseline_mode,
             )
+
+    def qwen_profile(self):
+        self.config["research"] = {"profile": "qwen_moe"}
+        directory = launcher.profile_directory("qwen_moe")
+        self.write(directory / "DESIGN.md", "Qwen contract\n")
+        self.write(directory / "control.py", "# Qwen controller fixture\n")
+        self.write(
+            directory / "runtime.py",
+            "from pathlib import Path\n"
+            "def config_issues(config):\n"
+            "    return [] if config.get('research', {}).get('profile') == 'qwen_moe' else ['profile required']\n"
+            "def render_task(root, manifest):\n"
+            "    return (Path(root) / 'agents/qwen_moe_optimization/DESIGN.md').read_text() + manifest['profile'] + '\\n'\n",
+        )
+        return directory
+
+    def test_legacy_manifest_and_task_rendering_stay_unchanged(self):
+        run = self.prepare()
+        manifest = launcher.load_bundle(run)
+        self.assertNotIn("profile", manifest)
+        self.assertNotIn("source_inventory_sha256", manifest)
+        self.assertEqual(launcher.manifest_profile(manifest), "legacy")
+        expected = (
+            "Manifest "
+            + launcher.hashlib.sha256(launcher.json_bytes(manifest)).hexdigest()
+            + "\nPolicy /workspace/simthesizer/"
+            + str(launcher.POLICY_REL)
+            + "\n"
+        )
+        self.assertEqual((run / "task/AGENTS.md").read_text(), expected)
+        self.assertEqual(launcher.render_task(run / "source", manifest), expected)
+
+    def test_profiles_reject_unknown_names_paths_and_conflicts(self):
+        for name in ("unknown", "../qwen_moe", "", ["qwen_moe"]):
+            with (
+                self.subTest(profile=name),
+                self.assertRaisesRegex(ValueError, "unsupported research profile"),
+            ):
+                launcher.profile_name(profile=name)
+        with self.assertRaisesRegex(ValueError, "research must be a table"):
+            launcher.profile_name({"research": []})
+        with self.assertRaisesRegex(ValueError, "differs"):
+            launcher.profile_name(
+                {"research": {"profile": "qwen_moe"}}, profile="legacy"
+            )
+        with self.assertRaisesRegex(ValueError, "differs"):
+            launcher.manifest_profile(
+                {"experiment": {"research": {"profile": "qwen_moe"}}}
+            )
+
+    def test_qwen_freezes_task_and_shared_tools_without_private_files(self):
+        directory = self.qwen_profile()
+        for name in ("agent.env", "experiment.toml", "runs/old/result.json"):
+            self.write(directory / name, "DO_NOT_COPY")
+        with patch.object(launcher, "command") as execute:
+            run = self.prepare()
+            manifest = launcher.load_bundle(run)
+        execute.assert_not_called()
+        self.assertEqual(manifest["profile"], "qwen_moe")
+        self.assertEqual(manifest["runtime_gaps"], [])
+        self.assertIn(str(directory / "runtime.py"), manifest["source_sha256"])
+        self.assertIn(str(launcher.EVALUATOR_REL), manifest["source_sha256"])
+        policy = str(launcher.POLICY_REL / "policy.rs")
+        self.assertNotIn(policy, manifest["source_sha256"])
+        self.assertIn(policy, manifest["source_inventory_sha256"])
+        self.assertEqual(
+            (run / "task/AGENTS.md").read_text(), "Qwen contract\nqwen_moe\n"
+        )
+        self.assertFalse(list((run / "source").rglob("__pycache__")))
+        self.assertFalse(
+            any(
+                "DO_NOT_COPY" in path.read_text()
+                for path in (run / "source").rglob("*")
+                if path.is_file()
+            )
+        )
+        # Rendering and validation use the frozen adapter and contract.
+        self.write(directory / "DESIGN.md", "changed live contract\n")
+        self.assertEqual(launcher.load_bundle(run), manifest)
+        (run / "source" / directory / "runtime.py").write_text("# changed\n")
+        with self.assertRaisesRegex(ValueError, "frozen source changed"):
+            launcher.load_bundle(run)
+
+    def test_qwen_reference_policy_is_immutable(self):
+        self.qwen_profile()
+        run = self.prepare()
+        (run / "source" / launcher.POLICY_REL / "policy.rs").write_text("// changed\n")
+        with self.assertRaisesRegex(ValueError, "frozen source inventory changed"):
+            launcher.load_bundle(run)
+
+    def test_legacy_snapshot_does_not_freeze_unselected_qwen_profile(self):
+        directory = self.qwen_profile()
+        self.config.pop("research")
+        run = self.prepare()
+        self.assertFalse((run / "source" / directory).exists())
+
+    def test_profile_runs_root_is_separate_and_rejects_project_ancestors(self):
+        self.qwen_profile()
+        expected = self.root / "agents/qwen_moe_optimization/runs"
+        self.assertEqual(launcher.resolve_runs_root(self.root, self.config), expected)
+        for forbidden in (
+            self.root,
+            self.base,
+            self.root / launcher.AGENT_REL / "runs",
+            self.root / "output/runs",
+        ):
+            with self.subTest(path=forbidden), self.assertRaises(ValueError):
+                launcher.resolve_runs_root(self.root, self.config, forbidden)
+        outside = self.base / "other-runs"
+        self.assertEqual(
+            launcher.resolve_runs_root(self.root, self.config, outside), outside
+        )
+
+    def test_qwen_check_and_prepare_never_execute_commands_or_read_credentials(self):
+        self.qwen_profile()
+        config = self.write("experiment.toml", "# parsed fixture\n")
+        for mode in ("--check", "--prepare-only"):
+            with (
+                self.subTest(mode=mode),
+                patch.object(launcher.tomllib, "loads", return_value=self.config),
+                patch.object(launcher, "command") as execute,
+                patch.object(launcher, "check_env_file") as credentials,
+                patch("sys.stdout", new=io.StringIO()),
+            ):
+                code = launcher.main(
+                    [mode, "--project", str(self.root), "--experiment", str(config)]
+                )
+            self.assertEqual(code, 0)
+            execute.assert_not_called()
+            credentials.assert_not_called()
+
+    def test_qwen_cannot_start_through_legacy_supervisor_or_entrypoint(self):
+        self.qwen_profile()
+        run = self.prepare()
+        manifest = launcher.load_bundle(run)
+        config = self.write("experiment.toml", "# parsed fixture\n")
+        for arguments in (
+            ["--project", str(self.root), "--experiment", str(config)],
+            ["--resume", str(run)],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(launcher.tomllib, "loads", return_value=self.config),
+                patch.object(launcher, "command") as execute,
+                patch.object(launcher, "check_env_file") as credentials,
+                self.assertRaisesRegex(ValueError, "run_qwen_moe_agent.sh"),
+            ):
+                launcher.main(arguments)
+            execute.assert_not_called()
+            credentials.assert_not_called()
+        with (
+            patch.object(Path, "read_text", return_value=json.dumps(manifest)),
+            patch.object(launcher, "command") as execute,
+            self.assertRaisesRegex(ValueError, "dedicated controller and entrypoint"),
+        ):
+            launcher.enter_container()
+        execute.assert_not_called()
+
+    def test_resume_cannot_change_the_frozen_profile(self):
+        run = self.prepare()
+        with (
+            patch.object(launcher, "command") as execute,
+            patch.object(launcher, "check_env_file") as credentials,
+            self.assertRaisesRegex(ValueError, "differs from the frozen profile"),
+        ):
+            launcher.main(["--resume", str(run), "--profile", "qwen_moe"])
+        execute.assert_not_called()
+        credentials.assert_not_called()
 
     def test_example_is_rejected_before_docker(self):
         with (
@@ -270,6 +442,34 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn("OPENAI_API_KEY", invocation.kwargs["env"])
         store.validate.assert_called_once_with(run, manifest)
         self.assertIn("--resume", stdout.getvalue())
+
+    def test_qwen_baseline_success_and_retry_use_the_qwen_entrypoint(self):
+        self.qwen_profile()
+        run = self.prepare(baseline_mode="local")
+        manifest = launcher.load_bundle(run)
+        with (
+            patch.dict("sys.modules", {"baseline_store": MagicMock()}),
+            patch.object(launcher, "command"),
+            patch.object(launcher, "baseline_command"),
+            patch("sys.stdout", new=io.StringIO()) as stdout,
+        ):
+            launcher.local_baseline(run, manifest)
+        self.assertIn("./run_qwen_moe_agent.sh --resume", stdout.getvalue())
+        self.assertNotIn("./run_rooflang_agent.sh", stdout.getvalue())
+        with (
+            patch.object(launcher, "command"),
+            patch.object(
+                launcher, "baseline_command", side_effect=ValueError("fixture failure")
+            ),
+            patch("sys.stderr", new=io.StringIO()) as stderr,
+            self.assertRaisesRegex(ValueError, "fixture failure"),
+        ):
+            launcher.local_baseline(run, manifest)
+        retry = shlex.split(stderr.getvalue().split("Resume: ", 1)[1].strip())
+        self.assertEqual(
+            retry[1], str(run / "source/agents/qwen_moe_optimization/control.py")
+        )
+        self.assertEqual(retry[-3:], ["--baseline-only", "--resume", str(run)])
 
     def test_failed_local_baseline_retains_progress_and_prints_quoted_resume(self):
         run = self.prepare(baseline_mode="local")
@@ -482,6 +682,7 @@ while True:
         )
 
     def test_snapshot_excludes_credentials_and_unselected_data(self):
+        self.write("examples/policies/adaptive.rs", "// frozen policy seed\n")
         for path in (
             "scripts/custom.env",
             "scripts/.env.secret",
@@ -493,6 +694,10 @@ while True:
             self.write(path, "DO_NOT_COPY")
         run = self.prepare()
         manifest = launcher.load_bundle(run)
+        self.assertEqual(
+            (run / "source/examples/policies/adaptive.rs").read_text(),
+            "// frozen policy seed\n",
+        )
         self.assertFalse(
             any(
                 "DO_NOT_COPY" in p.read_text()
@@ -598,6 +803,362 @@ while True:
             len([mount for mount in mounts if not mount.endswith(",readonly")]), 3
         )
 
+    def freeze_build_source(self):
+        source = self.root / launcher.AGENT_REL / "runs/20261119-180003/source"
+        for relative in launcher.BUILD_FILES.values():
+            destination = source / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((self.root / relative).read_bytes())
+        return source
+
+    def image_metadata(self, labels):
+        return {"Id": "sha256:" + "1" * 64, "Config": {"Labels": labels}}
+
+    def test_environment_identity_excludes_controllers_and_cargo_profiles(self):
+        versions = launcher.BUILD_DEFAULTS
+        environment = launcher.environment_identity(self.root, versions)
+        full = launcher.build_identity(self.root, versions)
+        for name in launcher.CONTROLLER_FILES:
+            self.write(launcher.BUILD_FILES[name], "updated controller\n")
+        cargo = self.root / "Cargo.toml"
+        cargo.write_text(
+            cargo.read_text() + '\n[profile.release]\nlto = "thin"\ncodegen-units = 1\n'
+        )
+        self.assertEqual(
+            launcher.environment_identity(self.root, versions), environment
+        )
+        self.assertNotEqual(launcher.build_identity(self.root, versions), full)
+
+    def test_environment_identity_tracks_dependencies_recipe_and_tool_versions(self):
+        versions = launcher.BUILD_DEFAULTS
+        environment = launcher.environment_identity(self.root, versions)
+        for name in (
+            "Dockerfile",
+            "Cargo.toml",
+            "Cargo.lock",
+            "pyproject.toml",
+            "uv.lock",
+            "crates/simthesizer-core/Cargo.toml",
+            "crates/simthesizer-cli/Cargo.toml",
+        ):
+            with self.subTest(name=name):
+                path = self.root / launcher.BUILD_FILES[name]
+                original = path.read_text()
+                change = (
+                    '\n[workspace.dependencies]\nnew_dependency = "1.0"\n'
+                    if name == "Cargo.toml"
+                    else "changed\n"
+                )
+                path.write_text(original + change)
+                self.assertNotEqual(
+                    launcher.environment_identity(self.root, versions), environment
+                )
+                path.write_text(original)
+        for key in versions:
+            with self.subTest(version=key):
+                changed = {**versions, key: versions[key] + "-changed"}
+                self.assertNotEqual(
+                    launcher.environment_identity(self.root, changed), environment
+                )
+
+    def test_matching_local_image_skips_refresh_and_online_build(self):
+        self.local_image.return_value = self.image_metadata(
+            {
+                launcher.BUILD_LABEL: launcher.build_identity(
+                    self.root, launcher.BUILD_DEFAULTS
+                )
+            }
+        )
+        with (
+            patch.object(launcher, "refresh_image") as refresh,
+            patch.object(launcher, "build_image_once") as online,
+            patch("sys.stdout", new=io.StringIO()),
+        ):
+            launcher.build_image(self.root, "test-image", launcher.BUILD_DEFAULTS)
+        refresh.assert_not_called()
+        online.assert_not_called()
+
+    def test_legacy_image_requires_recomputed_frozen_source_proof(self):
+        source = self.freeze_build_source()
+        versions = launcher.BUILD_DEFAULTS
+        old_identity = launcher.build_identity(source, versions)
+        self.write(launcher.AGENT_REL / "launcher.py", "new controller\n")
+        cargo = self.root / "Cargo.toml"
+        cargo.write_text(cargo.read_text() + '\n[profile.release]\nlto = "thin"\n')
+        metadata = self.image_metadata({launcher.BUILD_LABEL: old_identity})
+        self.local_image.return_value = metadata
+        with (
+            patch.object(launcher, "refresh_image") as refresh,
+            patch.object(launcher, "build_image_once") as online,
+            patch("sys.stdout", new=io.StringIO()),
+        ):
+            launcher.build_image(self.root, "test-image", versions)
+        refresh.assert_called_once_with(
+            self.root,
+            "test-image",
+            metadata["Id"],
+            versions,
+            launcher.build_identity(self.root, versions),
+            launcher.environment_identity(self.root, versions),
+        )
+        online.assert_not_called()
+
+    def test_legacy_image_missing_or_tampered_source_proof_is_rejected(self):
+        source = self.freeze_build_source()
+        old_identity = launcher.build_identity(source, launcher.BUILD_DEFAULTS)
+        self.write(launcher.AGENT_REL / "launcher.py", "new controller\n")
+        self.local_image.return_value = self.image_metadata(
+            {launcher.BUILD_LABEL: old_identity}
+        )
+        for failure in ("tampered", "missing"):
+            with self.subTest(failure=failure):
+                path = source / "Cargo.lock"
+                if failure == "tampered":
+                    path.write_text("changed frozen lock\n")
+                else:
+                    path.unlink()
+                with patch.object(launcher, "refresh_image") as refresh:
+                    self.assertFalse(
+                        launcher.reuse_build_image(
+                            self.root, "test-image", launcher.BUILD_DEFAULTS
+                        )
+                    )
+                refresh.assert_not_called()
+
+    def test_legacy_proof_does_not_allow_dependency_changes(self):
+        source = self.freeze_build_source()
+        self.local_image.return_value = self.image_metadata(
+            {
+                launcher.BUILD_LABEL: launcher.build_identity(
+                    source, launcher.BUILD_DEFAULTS
+                )
+            }
+        )
+        self.write("Cargo.lock", "new locked dependency\n")
+        with patch.object(launcher, "refresh_image") as refresh:
+            self.assertFalse(
+                launcher.reuse_build_image(
+                    self.root, "test-image", launcher.BUILD_DEFAULTS
+                )
+            )
+        refresh.assert_not_called()
+
+    def test_environment_label_allows_refresh_without_legacy_source(self):
+        versions = launcher.BUILD_DEFAULTS
+        self.local_image.return_value = self.image_metadata(
+            {
+                launcher.BUILD_LABEL: "old-controller-identity",
+                launcher.ENVIRONMENT_LABEL: launcher.environment_identity(
+                    self.root, versions
+                ),
+            }
+        )
+        with (
+            patch.object(launcher, "refresh_image") as refresh,
+            patch("sys.stdout", new=io.StringIO()),
+        ):
+            self.assertTrue(
+                launcher.reuse_build_image(self.root, "test-image", versions)
+            )
+        refresh.assert_called_once()
+
+    def test_mismatched_environment_label_cannot_fall_back_to_legacy_proof(self):
+        source = self.freeze_build_source()
+        versions = launcher.BUILD_DEFAULTS
+        self.local_image.return_value = self.image_metadata(
+            {
+                launcher.BUILD_LABEL: launcher.build_identity(source, versions),
+                launcher.ENVIRONMENT_LABEL: "incompatible-environment",
+            }
+        )
+        self.write(launcher.AGENT_REL / "launcher.py", "new controller\n")
+        with patch.object(launcher, "refresh_image") as refresh:
+            self.assertFalse(
+                launcher.reuse_build_image(self.root, "test-image", versions)
+            )
+        refresh.assert_not_called()
+
+    def test_offline_refresh_failure_does_not_fall_back_to_network(self):
+        versions = launcher.BUILD_DEFAULTS
+        self.local_image.return_value = self.image_metadata(
+            {
+                launcher.ENVIRONMENT_LABEL: launcher.environment_identity(
+                    self.root, versions
+                ),
+            }
+        )
+        for error in (
+            ValueError("environment check failed"),
+            launcher.BuildNetworkError("offline build failed"),
+        ):
+            with (
+                self.subTest(error=error),
+                patch.object(launcher, "refresh_image", side_effect=error),
+                patch.object(launcher, "build_image_once") as online,
+                patch("sys.stdout", new=io.StringIO()),
+                self.assertRaises(type(error)) as raised,
+            ):
+                launcher.build_image(
+                    self.root,
+                    "test-image",
+                    versions,
+                    fallback_proxy="http://fixture:7890",
+                )
+            self.assertIs(raised.exception, error)
+            online.assert_not_called()
+
+    def run_mock_refresh(self, failure=None):
+        events, contexts, commands = [], [], []
+        base_id, new_id = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+        expected = launcher.build_identity(self.root, launcher.BUILD_DEFAULTS)
+        environment = launcher.environment_identity(self.root, launcher.BUILD_DEFAULTS)
+
+        def command(argv, **kwargs):
+            commands.append(argv)
+            events.append(
+                "publish"
+                if argv[:3] == ["docker", "tag", new_id]
+                else "cleanup"
+                if argv[:3] == ["docker", "image", "rm"]
+                else "pin"
+            )
+            if failure == "cleanup" and argv[:3] == ["docker", "image", "rm"]:
+                raise ValueError("fixture temporary tag cleanup failed")
+
+        def build(argv, **kwargs):
+            events.append("build")
+            context = Path(argv[-1])
+            contexts.append(context)
+            self.assertEqual(
+                {path.name for path in context.iterdir()},
+                {"Dockerfile", "Cargo.toml", *launcher.CONTROLLER_FILES},
+            )
+            self.assertEqual(argv[:3], ["docker", "buildx", "build"])
+            self.assertEqual(argv[argv.index("--builder") + 1], "fixture-context")
+            self.assertIn("--pull=false", argv)
+            self.assertIn("--network=none", argv)
+            self.assertIn("--load", argv)
+            self.assertNotIn("--tag", argv)
+            self.assertNotIn("--build-arg", argv)
+            labels = [argv[i + 1] for i, value in enumerate(argv) if value == "--label"]
+            self.assertIn(f"{launcher.BUILD_LABEL}={expected}", labels)
+            self.assertIn(f"{launcher.ENVIRONMENT_LABEL}={environment}", labels)
+            pinned = commands[0]
+            self.assertEqual(pinned[:3], ["docker", "tag", base_id])
+            self.assertTrue(
+                pinned[3].startswith(f"simthesizer-agent-refresh:{os.getuid()}-")
+            )
+            recipe = (context / "Dockerfile").read_text()
+            self.assertTrue(recipe.startswith(f"FROM {pinned[3]}\n"))
+            self.assertIn("CARGO_HOME=/opt/cargo-seed", recipe)
+            self.assertIn("--offline --locked", recipe)
+            self.assertIn("--check-env", recipe)
+            self.assertNotIn("npm install", recipe)
+            self.assertNotIn("apt-get", recipe)
+            for name in (*launcher.CONTROLLER_FILES, "Cargo.toml"):
+                self.assertEqual(
+                    (context / name).read_bytes(),
+                    (self.root / launcher.BUILD_FILES[name]).read_bytes(),
+                )
+            if failure == "build":
+                raise ValueError("fixture offline build failed")
+            Path(argv[argv.index("--iidfile") + 1]).write_text(
+                "bad-image-id" if failure == "id" else new_id
+            )
+
+        def verify(image, identity):
+            events.append("verify")
+            self.assertEqual((image, identity), (new_id, expected))
+            if failure == "verify":
+                raise ValueError("fixture image validation failed")
+            return image
+
+        with (
+            patch.object(
+                launcher, "output", side_effect=["fixture-context", "Driver: docker\n"]
+            ) as output,
+            patch.object(launcher, "command", side_effect=command),
+            patch.object(launcher, "build_command", side_effect=build),
+            patch.object(launcher, "image_identity", side_effect=verify),
+            patch.object(launcher, "project_builder") as online_builder,
+        ):
+            if failure:
+                with self.assertRaises(ValueError):
+                    launcher.refresh_image(
+                        self.root,
+                        "test-image",
+                        base_id,
+                        launcher.BUILD_DEFAULTS,
+                        expected,
+                        environment,
+                    )
+            else:
+                launcher.refresh_image(
+                    self.root,
+                    "test-image",
+                    base_id,
+                    launcher.BUILD_DEFAULTS,
+                    expected,
+                    environment,
+                )
+        self.assertEqual(
+            output.call_args_list,
+            [
+                call(["docker", "context", "show"]),
+                call(["docker", "buildx", "inspect", "fixture-context"]),
+            ],
+        )
+        online_builder.assert_not_called()
+        self.assertEqual(len(contexts), 1)
+        self.assertFalse(contexts[0].exists())
+        cleanup = [argv for argv in commands if argv[:3] == ["docker", "image", "rm"]]
+        self.assertEqual(
+            cleanup, [["docker", "image", "rm", "--no-prune", commands[0][3]]]
+        )
+        return events, commands
+
+    def test_offline_refresh_validates_new_image_before_publishing(self):
+        events, commands = self.run_mock_refresh()
+        self.assertEqual(events, ["pin", "build", "verify", "cleanup", "publish"])
+        self.assertEqual(
+            commands[-1], ["docker", "tag", "sha256:" + "2" * 64, "test-image"]
+        )
+
+    def test_offline_refresh_failure_preserves_official_tag_and_cleans_own_tag(self):
+        for failure in ("build", "id", "verify", "cleanup"):
+            with self.subTest(failure=failure):
+                events, commands = self.run_mock_refresh(failure)
+                self.assertNotIn("publish", events)
+                self.assertEqual(len(commands), 2)
+                self.assertEqual(events[-1], "cleanup")
+
+    def test_offline_refresh_rejects_remote_builder_and_invalid_base_before_tagging(
+        self,
+    ):
+        for driver, base in (
+            ("docker-container", "sha256:" + "1" * 64),
+            ("docker", "untrusted:latest"),
+        ):
+            with (
+                self.subTest(driver=driver, base=base),
+                patch.object(
+                    launcher, "output", side_effect=["fixture", f"Driver: {driver}\n"]
+                ),
+                patch.object(launcher, "command") as command,
+                patch.object(launcher, "build_command") as build,
+                self.assertRaises(ValueError),
+            ):
+                launcher.refresh_image(
+                    self.root,
+                    "test-image",
+                    base,
+                    launcher.BUILD_DEFAULTS,
+                    "expected",
+                    "environment",
+                )
+            command.assert_not_called()
+            build.assert_not_called()
+
     def test_build_context_is_minimal(self):
         self.write("scripts/private.env", "secret")
         contexts = []
@@ -663,7 +1224,7 @@ while True:
             if operation == "create":
                 builders.add(name)
             else:
-                self.assertEqual(operation, "bootstrap")
+                self.assertIn(operation, ("bootstrap", "stop"))
             return subprocess.CompletedProcess(argv, 0, name + "\n", "")
 
         with (
@@ -711,7 +1272,7 @@ while True:
             self.assertNotIn("--use", argv)
             self.assertNotIn("mybuilder", argv)
             self.assertNotIn("BUILDX_BUILDER", env)
-            self.assertIn(argv[2], ("inspect", "create"))
+            self.assertIn(argv[2], ("inspect", "create", "stop"))
         self.assertEqual(marker.read_text(), "mybuilder")
 
     def test_builder_copies_proxies_with_csv_safe_no_proxy(self):
@@ -755,7 +1316,71 @@ while True:
                     names.append(name)
         self.assertNotEqual(*names)
         self.assertEqual(sum(argv[2] == "create" for argv, _ in calls), 2)
-        self.assertTrue(all(argv[2] in ("inspect", "create") for argv, _ in calls))
+        self.assertTrue(
+            all(argv[2] in ("inspect", "create", "stop") for argv, _ in calls)
+        )
+
+    def test_project_builder_stops_owned_identity_after_success_and_keeps_cache(self):
+        for existing in (False, True):
+            with (
+                self.subTest(existing=existing),
+                self.mock_buildx(existing=existing) as calls,
+            ):
+                with launcher.project_builder(self.root, launcher.BUILDKIT_IMAGE) as (
+                    name,
+                    env,
+                ):
+                    config = Path(env["BUILDX_CONFIG"])
+                    marker = config / "cache-marker"
+                    marker.write_text("retained")
+                self.assertEqual(calls[-1], (["docker", "buildx", "stop", name], env))
+                self.assertEqual(sum(argv[2] == "stop" for argv, _ in calls), 1)
+                self.assertFalse(
+                    any(argv[2] in ("rm", "prune", "use") for argv, _ in calls)
+                )
+                self.assertEqual(marker.read_text(), "retained")
+
+    def test_project_builder_stops_after_build_and_bootstrap_failures(self):
+        with (
+            self.mock_buildx() as calls,
+            self.assertRaisesRegex(RuntimeError, "original build failure"),
+            launcher.project_builder(self.root, launcher.BUILDKIT_IMAGE) as (name, _),
+        ):
+            raise RuntimeError("original build failure")
+        self.assertEqual(calls[-1][0], ["docker", "buildx", "stop", name])
+        with (
+            self.mock_buildx(
+                failures={"bootstrap": "fixture bootstrap error"}
+            ) as calls,
+            self.assertRaisesRegex(ValueError, "fixture bootstrap error"),
+            launcher.project_builder(self.root, launcher.BUILDKIT_IMAGE),
+        ):
+            self.fail("bootstrap failure entered the build")
+        self.assertEqual(calls[-1][0][2], "stop")
+
+    def test_builder_stop_failure_is_visible_and_preserves_original_error(self):
+        proxy = "http://user:fixture-secret@127.0.0.1:7890"
+        for body_fails in (False, True):
+            with (
+                self.subTest(body_fails=body_fails),
+                patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True),
+                self.mock_buildx(
+                    failures={"stop": f"cannot stop through {proxy}"}
+                ) as calls,
+                patch("sys.stderr", new=io.StringIO()) as stderr,
+            ):
+                expected = RuntimeError if body_fails else ValueError
+                detail = "original build failure" if body_fails else "stop failed"
+                with (
+                    self.assertRaisesRegex(expected, detail),
+                    launcher.project_builder(self.root, launcher.BUILDKIT_IMAGE),
+                ):
+                    if body_fails:
+                        raise RuntimeError("original build failure")
+                self.assertEqual(calls[-1][0][2], "stop")
+                self.assertIn("stop failed", stderr.getvalue())
+                self.assertIn("metadata retained", stderr.getvalue())
+                self.assertNotIn("fixture-secret", stderr.getvalue())
 
     def test_explicit_socks_proxy_overrides_shell_without_mutating_it(self):
         proxy = "socks5h://127.0.0.1:17890"

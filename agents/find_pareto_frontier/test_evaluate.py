@@ -320,6 +320,56 @@ class EvaluationTests(unittest.TestCase):
         ):
             self.experiment.capabilities(Path("/fake/simthesizer"))
 
+    def test_diagnostics_are_optional_frozen_and_require_native_capability(self):
+        candidate = {"kind": "candidate"}
+        self.assertNotIn(
+            "diagnostics", self.experiment.configuration(candidate)["system"]["policy"]
+        )
+        settings = {"max_samples": 3, "every_decisions": 100}
+        case = self.experiment.cases()[0]
+        rows = self.experiment.derived(case)
+        before = self.experiment.trial_identity(candidate, case, rows)
+        self.experiment.config["artifacts"]["policy_diagnostics"] = settings
+        self.assertNotEqual(
+            before, self.experiment.trial_identity(candidate, case, rows)
+        )
+        self.assertEqual(launcher.config_issues(self.experiment.config), [])
+        configured = self.experiment.configuration(candidate)
+        self.assertEqual(configured["system"]["policy"]["diagnostics"], settings)
+        configured["system"]["policy"]["diagnostics"]["max_samples"] = 1
+        self.assertEqual(settings["max_samples"], 3)
+        capabilities = {
+            "policy_api_version": evaluate.API_VERSION,
+            "actions": self.experiment.config["policy"]["actions"],
+            "validates_actions": True,
+            "checks_full_completion": True,
+            **self.experiment.config["model_assumptions"],
+        }
+        with (
+            patch.object(
+                subprocess, "check_output", return_value=json.dumps(capabilities)
+            ),
+            self.assertRaisesRegex(ValueError, "bounded policy samples"),
+        ):
+            self.experiment.capabilities(Path("/fake/simthesizer"))
+        capabilities["diagnostic_features"] = ["bounded-policy-samples-v1"]
+        with patch.object(
+            subprocess, "check_output", return_value=json.dumps(capabilities)
+        ):
+            self.experiment.capabilities(Path("/fake/simthesizer"))
+        for invalid in [
+            None,
+            {},
+            {"max_samples": 129, "every_decisions": 1},
+            {"max_samples": True, "every_decisions": 1},
+            {"max_samples": 1, "every_decisions": 0},
+        ]:
+            self.experiment.config["artifacts"]["policy_diagnostics"] = invalid
+            issues = launcher.config_issues(self.experiment.config)
+            self.assertEqual(bool(issues), invalid is not None)
+        del self.experiment.config["artifacts"]["policy_diagnostics"]
+        self.assertEqual(before, self.experiment.trial_identity(candidate, case, rows))
+
     def test_build_cache_checks_binary_and_candidate_source_identity(self):
         candidate = self.experiment.freeze_candidate()
 

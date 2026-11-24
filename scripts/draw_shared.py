@@ -44,6 +44,7 @@ def build_view(directory):
                 "gpu_model": hardware["gpu_model"],
                 "devices": hardware["gpu_ids"],
                 "tp": runner["tp"],
+                "ep": runner.get("ep", 1),
                 "scheduler": leaf["scheduler"],
             }
             instances.append(instance)
@@ -183,6 +184,10 @@ def build_view(directory):
         {origin, finish}
         | {t for n in by_id.values() for t in (n["start"], n["finish"]) if t >= origin}
     )
+    model = dict(system["model"])
+    if "num_hidden_layers" not in model:
+        audit = directory / "instances" / instances[0]["id"] / "audit/init.json"
+        model["num_hidden_layers"] = json.loads(audit.read_text())["model"]["layers"]
     data = {
         "nodes": graph["nodes"],
         "edges": graph["edges"],
@@ -198,7 +203,7 @@ def build_view(directory):
         "meta": {
             "directory": str(directory.resolve()),
             "mode": system["kv_handoff"],
-            "model": system["model"],
+            "model": model,
             "origin": origin,
             "finish": finish,
             "workload": read_rows(directory / "workload.jsonl"),

@@ -1,0 +1,7 @@
+# Generator settings, not a launch configuration. Materialize a fresh suite:
+# python agents/qwen_moe_optimization/workloads.py --output output/qwen-pressure
+# Then pass output/qwen-pressure/experiment.toml to the Qwen controller.
+# All three additions are synthetic, visible validation; no hidden holdout.
+base_experiment = "agents/qwen_moe_optimization/experiment.toml"
+seed = 0
+requests_per_workload = 24

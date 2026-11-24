@@ -37,6 +37,28 @@ these lines into a terminal progress bar while retaining the full command log.
 100% means all requests finished; report generation is a separate subsequent
 stage. The display does not estimate completion from elapsed wall time.
 
+## Host runtime
+
+`inspect_rooflang.py --wall-profile` saves bounded cumulative timing in
+`wall-profile.json`, `.csv` and `.txt`; the Qwen workload launcher enables it by
+default. `--no-wall-profile` disables it independently of detailed traces.
+Snapshots update at request-completion progress; final reports include metrics
+and plotting. This is host elapsed time, including waits, not simulated GPU time
+or CPU consumption. The final report write itself is outside the measured span.
+
+The CLI's `--output-wall-profile PATH` owns native timing, including engine,
+resource, graph and worker phases. Nested scopes subtract child time. Worker
+timing partitions synchronous calls into initialization, construction, encoding
+and audit work; Qwen additionally separates routing and operator pricing. Llama
+keeps pricing and reference execution within construction. Child rows are
+already included in their parent; percentages use the direct parent.
+
+The wrapper retains unmatched time explicitly: native startup/build/teardown
+and monitoring outside native timing; worker startup, pipe waiting and other
+unmeasured work within RPC. These residuals are not isolated compilation or
+transport measurements. Ordinary failures preserve partial totals. Disabled
+native/worker profiling reads no profiling clocks and changes no virtual events.
+
 ## Scheduler signals
 
 `chunked_prefill` exposes:

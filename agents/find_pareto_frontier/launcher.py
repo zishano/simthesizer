@@ -4,6 +4,7 @@ import argparse
 import csv
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import uuid
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,6 +30,10 @@ ROOT = HERE.parent.parent
 AGENT_REL = Path("agents/find_pareto_frontier")
 POLICY_REL = Path("crates/simthesizer-core/src/policies/candidate")
 EVALUATOR_REL = AGENT_REL / "evaluate.py"
+PROFILES = {
+    "legacy": AGENT_REL,
+    "qwen_moe": Path("agents/qwen_moe_optimization"),
+}
 IMAGE_DEFAULT = "simthesizer-pareto-agent:codex-0.166.0"
 BUILDKIT_IMAGE = "moby/buildkit:buildx-stable-1"
 BUILD_DEFAULTS = {
@@ -54,6 +60,9 @@ BUILD_FILES = {
         )
     },
 }
+BUILD_LABEL = "io.simthesizer.agent.build-input-sha256"
+ENVIRONMENT_LABEL = "io.simthesizer.agent.environment-input-sha256"
+CONTROLLER_FILES = ("entrypoint.sh", "launcher.py", "baseline_store.py")
 PROXIES = {
     name
     for base in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
@@ -125,6 +134,58 @@ def input_file(root, value):
     if path.is_symlink() or not path.is_file():
         fail(f"input must be a regular file: {path}")
     return path.resolve()
+
+
+def profile_name(config=None, *, profile=None):
+    """Select a known task; never interpret a profile as a filesystem path."""
+    research = (config or {}).get("research", {})
+    if not isinstance(research, dict):
+        fail("research must be a table")
+    configured = research.get("profile")
+    for value in (configured, profile):
+        if value is not None and (not isinstance(value, str) or value not in PROFILES):
+            fail(f"unsupported research profile: {value!r}")
+    if configured is not None and profile is not None and configured != profile:
+        fail("research.profile differs from the selected profile")
+    return profile or configured or "legacy"
+
+
+def manifest_profile(manifest):
+    # Legacy manifests lack this field; their rendering and hashes stay unchanged.
+    return profile_name(
+        manifest.get("experiment", {}), profile=manifest.get("profile", "legacy")
+    )
+
+
+def profile_directory(profile="legacy"):
+    return PROFILES[profile_name(profile=profile)]
+
+
+def resolve_runs_root(root, config, runs_root=None, *, profile=None):
+    root = safe_path(root)
+    selected = profile_name(config, profile=profile)
+    default = profile_directory(selected) / "runs"
+    result = safe_path(
+        runs_root or root / config.get("artifacts", {}).get("runs_root", str(default))
+    )
+    if result == root or root.is_relative_to(result):
+        fail("runs-root must not be the project or an ancestor")
+    if result.is_relative_to(root) and result != root / default:
+        fail(f"inside the project, use {default}")
+    return result
+
+
+def profile_runtime(root, profile):
+    """Load the selected frozen task adapter without changing import search paths."""
+    relative = profile_directory(profile) / "runtime.py"
+    path = input_file(root, relative)
+    spec = importlib.util.spec_from_file_location("simthesizer_task_runtime", path)
+    if spec is None or spec.loader is None:
+        fail(f"cannot load task runtime: {relative}")
+    module = importlib.util.module_from_spec(spec)
+    # Do not create __pycache__ inside the immutable source snapshot.
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)  # noqa: S102 -- fixed, frozen task adapter
+    return module
 
 
 def config_issues(config):
@@ -209,6 +270,19 @@ def config_issues(config):
     diagnostic_budget = config.get("artifacts", {}).get("diagnostic_budget_mib")
     if type(diagnostic_budget) is not int or diagnostic_budget < 0:
         issues.append("artifacts.diagnostic_budget_mib: nonnegative integer required")
+    policy_diagnostics = config["artifacts"].get("policy_diagnostics")
+    if policy_diagnostics is not None and (
+        not isinstance(policy_diagnostics, dict)
+        or set(policy_diagnostics) != {"max_samples", "every_decisions"}
+        or type(policy_diagnostics.get("max_samples")) is not int
+        or not 1 <= policy_diagnostics["max_samples"] <= 128
+        or type(policy_diagnostics.get("every_decisions")) is not int
+        or policy_diagnostics["every_decisions"] < 1
+    ):
+        issues.append(
+            "artifacts.policy_diagnostics: max_samples must be 1..128 and "
+            "every_decisions a positive integer"
+        )
     for field in (
         "p_token_budget_bounds",
         "d_token_budget_bounds",
@@ -294,12 +368,18 @@ def config_issues(config):
     return list(dict.fromkeys(issues))
 
 
-def runtime_gaps(root):
+def runtime_gaps(root, *, profile="legacy"):
+    selected = profile_name(profile=profile)
     gaps = []
     if not (root / POLICY_REL).is_dir() or not list((root / POLICY_REL).glob("*.rs")):
         gaps.append(f"policy implementation is missing: {POLICY_REL}")
     if not (root / EVALUATOR_REL).is_file():
         gaps.append(f"trusted evaluator is missing: {EVALUATOR_REL}")
+    if selected != "legacy":
+        for name in ("runtime.py", "control.py"):
+            relative = profile_directory(selected) / name
+            if not (root / relative).is_file():
+                gaps.append(f"task runtime is missing: {relative}")
     return gaps
 
 
@@ -314,6 +394,140 @@ def build_identity(root, versions):
             }
         )
     ).hexdigest()
+
+
+def environment_identity(root, versions):
+    """Dependency installation is independent of controllers and Cargo profiles."""
+    files = {}
+    for name, path in BUILD_FILES.items():
+        if name in CONTROLLER_FILES:
+            continue
+        if name == "Cargo.toml":
+            manifest = tomllib.loads((root / path).read_text())
+            manifest.pop("profile", None)
+            files[name] = hashlib.sha256(json_bytes(manifest)).hexdigest()
+        else:
+            files[name] = digest(root / path)
+    return hashlib.sha256(
+        json_bytes({"schema_version": 1, "versions": versions, "files": files})
+    ).hexdigest()
+
+
+def local_image(image):
+    result = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        if "no such image" in result.stderr.lower():
+            return None
+        fail("cannot inspect local Docker image: " + result.stderr.strip())
+    return json.loads(result.stdout)[0]
+
+
+def reuse_build_image(root, image, versions):
+    metadata = local_image(image)
+    if metadata is None:
+        return False
+    labels = metadata.get("Config", {}).get("Labels") or {}
+    expected = build_identity(root, versions)
+    if labels.get(BUILD_LABEL) == expected:
+        print("Build: local image already matches; reusing it.", flush=True)
+        return True
+    environment = environment_identity(root, versions)
+    compatible = labels.get(ENVIRONMENT_LABEL) == environment
+    if ENVIRONMENT_LABEL not in labels and labels.get(BUILD_LABEL):
+        # Older images have only the complete fingerprint. Recompute it from
+        # a frozen source bundle before trusting its environment inputs.
+        for directory in PROFILES.values():
+            for source in sorted(
+                (root / directory / "runs").glob("*/source"), reverse=True
+            ):
+                try:
+                    if build_identity(source, versions) != labels[BUILD_LABEL]:
+                        continue
+                    compatible = environment_identity(source, versions) == environment
+                except FileNotFoundError, tomllib.TOMLDecodeError:
+                    continue
+                break
+            if compatible:
+                break
+    if not compatible:
+        return False
+    print(
+        "Build: verified existing dependencies; refreshing image offline.", flush=True
+    )
+    refresh_image(root, image, metadata["Id"], versions, expected, environment)
+    return True
+
+
+def refresh_image(root, image, base_id, versions, expected, environment):
+    # The daemon's docker driver can use local images. A docker-container
+    # builder would try to resolve this base from a registry instead.
+    builder = output(["docker", "context", "show"])
+    description = output(["docker", "buildx", "inspect", builder])
+    if not re.search(r"^Driver:\s+docker\s*$", description, re.MULTILINE):
+        fail("offline refresh requires the current Docker context's docker driver")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", base_id):
+        fail("invalid local base image ID")
+    base_tag = f"simthesizer-agent-refresh:{os.getuid()}-{uuid.uuid4().hex}"
+    with tempfile.TemporaryDirectory(prefix="sim-agent-refresh-") as name:
+        temporary = Path(name)
+        context = temporary / "context"
+        context.mkdir()
+        for target in (*CONTROLLER_FILES, "Cargo.toml"):
+            shutil.copyfile(root / BUILD_FILES[target], context / target)
+        (context / "Dockerfile").write_text(
+            f"FROM {base_tag}\n"
+            "COPY entrypoint.sh launcher.py baseline_store.py /opt/sim-agent/\n"
+            "COPY Cargo.toml /opt/cargo-project/Cargo.toml\n"
+            "RUN chmod 0755 /opt/sim-agent/entrypoint.sh "
+            "&& chmod 0644 /opt/sim-agent/*.py /opt/cargo-project/Cargo.toml "
+            "&& CARGO_HOME=/opt/cargo-seed /opt/sim-agent/entrypoint.sh --check-env "
+            "&& CARGO_HOME=/opt/cargo-seed cargo fetch --offline --locked "
+            "--manifest-path /opt/cargo-project/Cargo.toml "
+            "&& python -m py_compile /opt/sim-agent/launcher.py /opt/sim-agent/baseline_store.py "
+            f'&& test "$(codex --version)" = {shlex.quote("codex-cli " + versions["CODEX_VERSION"])}\n'
+        )
+        iidfile = temporary / "image-id"
+        command(["docker", "tag", base_id, base_tag])
+        try:
+            build_command(
+                [
+                    "docker",
+                    "buildx",
+                    "build",
+                    "--builder",
+                    builder,
+                    "--pull=false",
+                    "--network=none",
+                    "--load",
+                    "--progress=plain",
+                    "--iidfile",
+                    str(iidfile),
+                    "--label",
+                    f"{BUILD_LABEL}={expected}",
+                    "--label",
+                    f"{ENVIRONMENT_LABEL}={environment}",
+                    str(context),
+                ],
+                env=os.environ.copy(),
+            )
+            new_id = iidfile.read_text().strip()
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", new_id):
+                fail("offline refresh returned an invalid image ID")
+            image_identity(new_id, expected)
+        finally:
+            command(
+                ["docker", "image", "rm", "--no-prune", base_tag],
+                stdout=subprocess.DEVNULL,
+            )
+        # Remove the temporary tag while the original image is still tagged.
+        # Retagging only after validation also leaves that original image intact.
+        command(["docker", "tag", new_id, image])
 
 
 def driver_option(value):
@@ -396,9 +610,9 @@ def project_builder(root, buildkit_image, proxy=None):
     # Never inherit another user's selected builder.
     env.pop("BUILDX_BUILDER", None)
 
-    def invoke(argv, operation, *, allow_missing=False):
+    def invoke(argv, operation, *, allow_missing=False, timeout=None):
         result = subprocess.run(
-            argv, env=env, capture_output=True, text=True, check=False
+            argv, env=env, capture_output=True, text=True, check=False, timeout=timeout
         )
         if result.returncode:
             if (
@@ -445,11 +659,28 @@ def project_builder(root, buildkit_image, proxy=None):
                 f"project builder {name} has an unexpected driver; refusing to change it"
             )
         print(f"Build: {name}; host network; metadata: {config}", flush=True)
-        invoke(
-            ["docker", "buildx", "inspect", "--bootstrap", name],
-            f"bootstrap (requires local {buildkit_image} or registry access to fetch it)",
-        )
-        yield name, env
+        failed = False
+        try:
+            invoke(
+                ["docker", "buildx", "inspect", "--bootstrap", name],
+                f"bootstrap (requires local {buildkit_image} or registry access to fetch it)",
+            )
+            yield name, env
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            # The project lock covers bootstrap, build, and shutdown. Keep the
+            # builder metadata/cache; stop only this UID/project/daemon identity.
+            try:
+                invoke(["docker", "buildx", "stop", name], "stop", timeout=30)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(
+                    f"warning: {error}; builder metadata retained at {config}",
+                    file=sys.stderr,
+                )
+                if not failed:
+                    raise
 
 
 def build_command(argv, env):
@@ -494,6 +725,8 @@ def build_image_once(root, image, versions, buildkit_image, proxy):
             image,
             "--file",
             str(context / "Dockerfile"),
+            "--label",
+            f"{ENVIRONMENT_LABEL}={environment_identity(root, versions)}",
         ]
         for key, value in {
             **versions,
@@ -516,6 +749,8 @@ def build_image(
 ):
     validate_build_proxy(proxy)
     validate_build_proxy(fallback_proxy)
+    if reuse_build_image(root, image, versions):
+        return
     try:
         build_image_once(root, image, versions, buildkit_image, proxy)
     except BuildNetworkError:
@@ -531,7 +766,7 @@ def build_image(
 def image_identity(image, expected):
     metadata = json.loads(output(["docker", "image", "inspect", image]))[0]
     labels = metadata.get("Config", {}).get("Labels") or {}
-    if labels.get("io.simthesizer.agent.build-input-sha256") != expected:
+    if labels.get(BUILD_LABEL) != expected:
         fail("image build inputs differ; rebuild with run-agent.sh --build-only")
     return metadata["Id"]
 
@@ -543,7 +778,7 @@ def excluded(relative):
     )
 
 
-def source_files(root):
+def source_files(root, *, profile="legacy"):
     # Positive roots prevent copying arbitrary local experiments and credentials.
     for name in (
         "Cargo.toml",
@@ -555,15 +790,20 @@ def source_files(root):
     ):
         if (root / name).is_file():
             yield Path(name)
-    for name in (
+    names = (
         "crates",
         "scripts",
         "tests",
         "tools",
         "architectures",
         "examples/scenarios",
+        "examples/policies",
         str(AGENT_REL),
-    ):
+    )
+    selected = profile_directory(profile)
+    if selected != AGENT_REL:
+        names += (str(selected),)
+    for name in names:
         for base, directories, files in os.walk(root / name, followlinks=False):
             relative = Path(base).relative_to(root)
             directories[:] = sorted(
@@ -595,6 +835,9 @@ def inventory(root, *, mutable=False):
 
 
 def render_task(root, manifest):
+    profile = manifest_profile(manifest)
+    if profile != "legacy":
+        return profile_runtime(root, profile).render_task(root, manifest)
     values = {
         "MANIFEST_PATH": "/workspace/task/manifest.json",
         "MANIFEST_SHA256": hashlib.sha256(json_bytes(manifest)).hexdigest(),
@@ -626,7 +869,10 @@ reference. Local baseline attempts and time already count toward search budgets.
     return task
 
 
-def prepare(root, config, runs_root, versions, network, *, baseline_mode=None):
+def prepare(
+    root, config, runs_root, versions, network, *, baseline_mode=None, profile=None
+):
+    profile = profile_name(config, profile=profile)
     if baseline_mode not in (None, "local"):
         fail("unsupported baseline mode")
     runs_root.mkdir(parents=True, exist_ok=True)
@@ -642,7 +888,7 @@ def prepare(root, config, runs_root, versions, network, *, baseline_mode=None):
         fail("cannot allocate a unique run directory")
     for name in ("source", "task", "inputs", "artifacts", "cache", "baseline-policy"):
         (run / name).mkdir()
-    for relative in source_files(root):
+    for relative in source_files(root, profile=profile):
         target = run / "source" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / relative, target)
@@ -683,10 +929,13 @@ def prepare(root, config, runs_root, versions, network, *, baseline_mode=None):
         "baseline_policy_sha256": inventory(run / "baseline-policy"),
         "inputs_sha256": inventory(run / "inputs"),
         "input_path_mapping": mapping,
-        "runtime_gaps": runtime_gaps(root),
+        "runtime_gaps": runtime_gaps(root, profile=profile),
     }
     if baseline_mode is not None:
         manifest["baseline_mode"] = baseline_mode
+    if profile != "legacy":
+        manifest["profile"] = profile
+        manifest["source_inventory_sha256"] = inventory(run / "source")
     save(run / "task/manifest.json", manifest)
     (run / "task/AGENTS.md").write_text(render_task(run / "source", manifest))
     save(run / "supervisor.json", {"consumed_wall_seconds": 0, "active": None})
@@ -696,16 +945,28 @@ def prepare(root, config, runs_root, versions, network, *, baseline_mode=None):
 
 def load_bundle(run):
     manifest = json.loads((run / "task/manifest.json").read_text())
+    profile = manifest_profile(manifest)
     if manifest.get("baseline_mode") not in (None, "local"):
         fail("unsupported frozen baseline mode")
     for folder, field in (("source", "source_sha256"), ("inputs", "inputs_sha256")):
         if inventory(run / folder, mutable=folder == "source") != manifest[field]:
             fail(f"frozen {folder} changed; start a new experiment")
+    if profile != "legacy" and inventory(run / "source") != manifest.get(
+        "source_inventory_sha256"
+    ):
+        fail("frozen source inventory changed; start a new experiment")
     if inventory(run / "baseline-policy") != manifest["baseline_policy_sha256"]:
         fail("baseline policy changed")
     if (run / "task/AGENTS.md").read_text() != render_task(run / "source", manifest):
         fail("rendered task changed")
-    if config_issues(manifest["experiment"]):
+    issues = (
+        config_issues(manifest["experiment"])
+        if profile == "legacy"
+        else profile_runtime(run / "source", profile).config_issues(
+            manifest["experiment"]
+        )
+    )
+    if issues:
         fail("frozen experiment is invalid")
     candidate = run / "source" / POLICY_REL
     if candidate.exists():
@@ -768,10 +1029,16 @@ def local_baseline(run, manifest):
         if key not in {"CODEX_API_KEY", "OPENAI_API_KEY"}
     }
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    profile = manifest_profile(manifest)
+    controller = (
+        Path(__file__).resolve()
+        if profile == "legacy"
+        else run / "source" / profile_directory(profile) / "control.py"
+    )
     resume = shlex.join(
         [
             sys.executable,
-            str(Path(__file__).resolve()),
+            str(controller),
             "--baseline-only",
             "--resume",
             str(run),
@@ -813,8 +1080,9 @@ def local_baseline(run, manifest):
             file=sys.stderr,
         )
         raise
+    script = "run_rooflang_agent.sh" if profile == "legacy" else "run_qwen_moe_agent.sh"
     print(
-        f"Local baseline ready: {run}\nStart agent with: ./run_rooflang_agent.sh --resume {shlex.quote(str(run))}"
+        f"Local baseline ready: {run}\nStart agent with: ./{script} --resume {shlex.quote(str(run))}"
     )
     return 0
 
@@ -1044,6 +1312,8 @@ def supervise(run, manifest, image_id, env_file, *, baseline=None):
 def enter_container():
     manifest_path = Path("/workspace/task/manifest.json")
     manifest = json.loads(manifest_path.read_text())
+    if manifest_profile(manifest) != "legacy":
+        fail("Qwen mechanism search requires its dedicated controller and entrypoint")
     root = Path("/workspace/simthesizer")
     if (
         inventory(root, mutable=True) != manifest["source_sha256"]
@@ -1165,6 +1435,7 @@ def main(argv=None):
         help="prepare a local baseline without Docker/API; may resume a local baseline run",
     )
     parser.add_argument("--experiment", type=Path)
+    parser.add_argument("--profile", choices=tuple(PROFILES))
     parser.add_argument("--project", type=Path, default=ROOT)
     parser.add_argument("--runs-root", type=Path)
     parser.add_argument("--env-file", type=Path)
@@ -1227,8 +1498,15 @@ def main(argv=None):
         if not args.experiment:
             parser.error("--experiment is required (or use --build-only / --resume)")
         config = tomllib.loads(args.experiment.read_text())
-        issues = config_issues(config)
-        gaps = runtime_gaps(root)
+        profile = profile_name(config, profile=args.profile)
+        if profile != "legacy" and not (args.check or args.prepare_only):
+            fail("Qwen mechanism search must use run_qwen_moe_agent.sh")
+        gaps = runtime_gaps(root, profile=profile)
+        issues = (
+            config_issues(config)
+            if profile == "legacy"
+            else profile_runtime(root, profile).config_issues(config)
+        )
         if not issues:
             for path in [
                 config["inputs"]["scenario"],
@@ -1260,15 +1538,7 @@ def main(argv=None):
             fail("invalid experiment:\n  " + "\n  ".join(issues))
         if gaps and not args.prepare_only:
             fail("search cannot start:\n  " + "\n  ".join(gaps))
-        runs_root = safe_path(
-            args.runs_root
-            or root
-            / config.get("artifacts", {}).get("runs_root", str(AGENT_REL / "runs"))
-        )
-        if runs_root == root or root.is_relative_to(runs_root):
-            fail("runs-root must not be the project or an ancestor")
-        if runs_root.is_relative_to(root) and runs_root != root / AGENT_REL / "runs":
-            fail("inside the project, use agents/find_pareto_frontier/runs")
+        runs_root = resolve_runs_root(root, config, args.runs_root, profile=profile)
         if args.build:
             build_image(
                 root,
@@ -1285,6 +1555,7 @@ def main(argv=None):
             versions,
             args.network,
             baseline_mode="local" if args.baseline_only else None,
+            profile=profile,
         )
         if args.prepare_only:
             print(
@@ -1299,6 +1570,10 @@ def main(argv=None):
         except BlockingIOError:
             fail("another launcher already owns this run")
         manifest = load_bundle(run)
+        if manifest_profile(manifest) != "legacy":
+            fail("Qwen mechanism search must use run_qwen_moe_agent.sh")
+        if args.profile is not None and args.profile != manifest_profile(manifest):
+            fail("--profile differs from the frozen profile")
         gaps = runtime_gaps(run / "source")
         if gaps:
             fail("search cannot start: " + "; ".join(gaps))

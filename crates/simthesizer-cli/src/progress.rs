@@ -28,10 +28,12 @@ impl Progress {
             "invalid completed-request count"
         );
         if self.previous != Some(completed) {
-            eprintln!(
-                "SIMTHESIZER_PROGRESS {}",
-                serde_json::json!({"completed": completed, "total": self.total, "time_s": time_s})
-            );
+            let mut event =
+                serde_json::json!({"completed": completed, "total": self.total, "time_s": time_s});
+            if let Some(profile) = simthesizer_core::wall_profile::snapshot() {
+                event["wall_profile"] = serde_json::to_value(profile)?;
+            }
+            eprintln!("SIMTHESIZER_PROGRESS {event}");
             self.previous = Some(completed);
         }
         Ok(())

@@ -73,7 +73,7 @@ own all serving semantics and reach the engine only through graph nodes.
   prices point-to-point transfers over a topology; see
   [cost models](architectures/cost-models.md).
 - Rooflang runners use bundled source to price whole Llama iterations or lower
-  operator demands into native shared-resource events, without profiling tables;
+  Llama TP / Qwen3 Attention TP and MoE EP demands into native shared-resource events, without profiling tables;
   see [Rooflang integration](architectures/rooflang.md).
 - `scripts/profile.py` measures vLLM components and preserves exact batch shapes
   in JSONL; see [profiling](architectures/profiling.md).

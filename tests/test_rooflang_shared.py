@@ -33,6 +33,7 @@ class SharedExecutionTests(unittest.TestCase):
         trace=True,
         budget=128,
         colocated=False,
+        policy_stats=False,
     ):
         evidence = os.environ.get("SHARED_TEST_OUTPUT")
         if evidence:
@@ -131,6 +132,8 @@ class SharedExecutionTests(unittest.TestCase):
                 "--output-engine-trace",
                 str(root / "state.jsonl"),
             ]
+        if policy_stats:
+            command += ["--output-policy-stats", str(root / "policy-stats.json")]
         result = subprocess.run(
             command, cwd=ROOT, capture_output=True, text=True, timeout=180, check=False
         )

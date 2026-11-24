@@ -1,6 +1,10 @@
 # Rooflang integration
 
 Two execution modes share the validated Llama graph and hardware presets.
+Shared mode also supports the fixed Qwen3-235B-A22B Attention TP / EP graph through
+`run_qwen3_235b_shared.sh`; its routing, memory and synchronization contract is
+documented in [shared execution](rooflang-shared.md). The descriptions below
+refer to the Llama bridge unless stated otherwise.
 `exclusive` retains the whole-iteration bridge described below. `shared`
 lowers operators into native events with cross-instance resources and persistent
 KV; see [shared execution](rooflang-shared.md). Agent search is separate.

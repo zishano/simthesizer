@@ -1,0 +1,2141 @@
+# run_qwen3_235b_shared_workload.sh 的配置快照；不随脚本自动变化。
+# P/D 各 2 个 H200 EP8 副本，Attention TP2、expert TP1；共 32 张模拟 GPU。
+# P/D 每副本 token 预算 128/32、max_batch 32；KV whole，专家路由 seed 0。
+# topology_pd_config 导出完整硬件与 KV 路由；仅指标，无 audit/trace。
+# worker 使用启动环境的 Python；原生模型预设提供 Qwen3-235B-A22B 尺寸。
+
+
+[system]
+kind = "pd_disaggregation"
+shared_execution = true
+allow_gpu_sharing = false
+kv_handoff = "whole"
+tp = 1
+
+[system.model]
+kind = "qwen3_235b_a22b"
+
+[system.network_sim]
+kind = "flow"
+
+[[system.prefill_instances]]
+kind = "single_instance"
+
+[system.prefill_instances.model_runner]
+kind = "rooflang"
+tp = 2
+command = ["python", "scripts/rooflang_worker.py"]
+graph_model = "qwen3_235b_a22b"
+routing_seed = 0
+instance_id = "p0"
+shared_execution = true
+stage = "p"
+ep = 8
+expert_tp = 1
+attention_groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+[system.prefill_instances.model_runner.hardware]
+gpu_model = "h200"
+gpu_count = 8
+gpu_ids = ["cluster/n0-nvidia-h200-sxm-0", "cluster/n0-nvidia-h200-sxm-1", "cluster/n0-nvidia-h200-sxm-2", "cluster/n0-nvidia-h200-sxm-3", "cluster/n0-nvidia-h200-sxm-4", "cluster/n0-nvidia-h200-sxm-5", "cluster/n0-nvidia-h200-sxm-6", "cluster/n0-nvidia-h200-sxm-7"]
+
+[system.prefill_instances.model_runner.hardware.topology]
+links = []
+
+[[system.prefill_instances.model_runner.hardware.topology.clusters]]
+id = "cluster"
+gpu_model = "h200"
+n_nodes = 4
+
+[system.prefill_instances.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 128
+device_mem = 144000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.prefill_instances.model]
+kind = "qwen3_235b_a22b"
+
+[[system.prefill_instances]]
+kind = "single_instance"
+
+[system.prefill_instances.model_runner]
+kind = "rooflang"
+tp = 2
+command = ["python", "scripts/rooflang_worker.py"]
+graph_model = "qwen3_235b_a22b"
+routing_seed = 0
+instance_id = "p1"
+shared_execution = true
+stage = "p"
+ep = 8
+expert_tp = 1
+attention_groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+[system.prefill_instances.model_runner.hardware]
+gpu_model = "h200"
+gpu_count = 8
+gpu_ids = ["cluster/n1-nvidia-h200-sxm-0", "cluster/n1-nvidia-h200-sxm-1", "cluster/n1-nvidia-h200-sxm-2", "cluster/n1-nvidia-h200-sxm-3", "cluster/n1-nvidia-h200-sxm-4", "cluster/n1-nvidia-h200-sxm-5", "cluster/n1-nvidia-h200-sxm-6", "cluster/n1-nvidia-h200-sxm-7"]
+
+[system.prefill_instances.model_runner.hardware.topology]
+links = []
+
+[[system.prefill_instances.model_runner.hardware.topology.clusters]]
+id = "cluster"
+gpu_model = "h200"
+n_nodes = 4
+
+[system.prefill_instances.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 128
+device_mem = 144000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.prefill_instances.model]
+kind = "qwen3_235b_a22b"
+
+[[system.decode_instances]]
+kind = "single_instance"
+
+[system.decode_instances.model_runner]
+kind = "rooflang"
+tp = 2
+command = ["python", "scripts/rooflang_worker.py"]
+graph_model = "qwen3_235b_a22b"
+routing_seed = 0
+instance_id = "d0"
+shared_execution = true
+stage = "d"
+ep = 8
+expert_tp = 1
+attention_groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+[system.decode_instances.model_runner.hardware]
+gpu_model = "h200"
+gpu_count = 8
+gpu_ids = ["cluster/n2-nvidia-h200-sxm-0", "cluster/n2-nvidia-h200-sxm-1", "cluster/n2-nvidia-h200-sxm-2", "cluster/n2-nvidia-h200-sxm-3", "cluster/n2-nvidia-h200-sxm-4", "cluster/n2-nvidia-h200-sxm-5", "cluster/n2-nvidia-h200-sxm-6", "cluster/n2-nvidia-h200-sxm-7"]
+
+[system.decode_instances.model_runner.hardware.topology]
+links = []
+
+[[system.decode_instances.model_runner.hardware.topology.clusters]]
+id = "cluster"
+gpu_model = "h200"
+n_nodes = 4
+
+[system.decode_instances.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 32
+device_mem = 144000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.decode_instances.model]
+kind = "qwen3_235b_a22b"
+
+[[system.decode_instances]]
+kind = "single_instance"
+
+[system.decode_instances.model_runner]
+kind = "rooflang"
+tp = 2
+command = ["python", "scripts/rooflang_worker.py"]
+graph_model = "qwen3_235b_a22b"
+routing_seed = 0
+instance_id = "d1"
+shared_execution = true
+stage = "d"
+ep = 8
+expert_tp = 1
+attention_groups = [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+[system.decode_instances.model_runner.hardware]
+gpu_model = "h200"
+gpu_count = 8
+gpu_ids = ["cluster/n3-nvidia-h200-sxm-0", "cluster/n3-nvidia-h200-sxm-1", "cluster/n3-nvidia-h200-sxm-2", "cluster/n3-nvidia-h200-sxm-3", "cluster/n3-nvidia-h200-sxm-4", "cluster/n3-nvidia-h200-sxm-5", "cluster/n3-nvidia-h200-sxm-6", "cluster/n3-nvidia-h200-sxm-7"]
+
+[system.decode_instances.model_runner.hardware.topology]
+links = []
+
+[[system.decode_instances.model_runner.hardware.topology.clusters]]
+id = "cluster"
+gpu_model = "h200"
+n_nodes = 4
+
+[system.decode_instances.scheduler]
+kind = "chunked_prefill"
+block_size = 16
+max_batch = 32
+max_num_batched_tokens = 32
+device_mem = 144000000000
+device_mem_utilization = 0.9
+enable_prefix_caching = false
+
+[system.decode_instances.model]
+kind = "qwen3_235b_a22b"
+
+[system.kv_topology]
+devices = ["cluster/ib-switch", "cluster/n0-ddr5-0", "cluster/n0-ddr5-1", "cluster/n0-hbm3e-0", "cluster/n0-hbm3e-1", "cluster/n0-hbm3e-2", "cluster/n0-hbm3e-3", "cluster/n0-hbm3e-4", "cluster/n0-hbm3e-5", "cluster/n0-hbm3e-6", "cluster/n0-hbm3e-7", "cluster/n0-hgx-pcie-switch-0", "cluster/n0-hgx-pcie-switch-1", "cluster/n0-hgx-pcie-switch-2", "cluster/n0-hgx-pcie-switch-3", "cluster/n0-hgx-pcie-switch-4", "cluster/n0-hgx-pcie-switch-5", "cluster/n0-hgx-pcie-switch-6", "cluster/n0-hgx-pcie-switch-7", "cluster/n0-intel-xeon-6767p-0", "cluster/n0-intel-xeon-6767p-1", "cluster/n0-mellanox-cx7-0", "cluster/n0-mellanox-cx7-1", "cluster/n0-mellanox-cx7-2", "cluster/n0-mellanox-cx7-3", "cluster/n0-mellanox-cx7-4", "cluster/n0-mellanox-cx7-5", "cluster/n0-mellanox-cx7-6", "cluster/n0-mellanox-cx7-7", "cluster/n0-nvidia-h200-sxm-0", "cluster/n0-nvidia-h200-sxm-1", "cluster/n0-nvidia-h200-sxm-2", "cluster/n0-nvidia-h200-sxm-3", "cluster/n0-nvidia-h200-sxm-4", "cluster/n0-nvidia-h200-sxm-5", "cluster/n0-nvidia-h200-sxm-6", "cluster/n0-nvidia-h200-sxm-7", "cluster/n0-nvswitch", "cluster/n0-ssd-0", "cluster/n0-ssd-1", "cluster/n0-ssd-2", "cluster/n0-ssd-3", "cluster/n0-ssd-4", "cluster/n0-ssd-5", "cluster/n0-ssd-6", "cluster/n0-ssd-7", "cluster/n1-ddr5-0", "cluster/n1-ddr5-1", "cluster/n1-hbm3e-0", "cluster/n1-hbm3e-1", "cluster/n1-hbm3e-2", "cluster/n1-hbm3e-3", "cluster/n1-hbm3e-4", "cluster/n1-hbm3e-5", "cluster/n1-hbm3e-6", "cluster/n1-hbm3e-7", "cluster/n1-hgx-pcie-switch-0", "cluster/n1-hgx-pcie-switch-1", "cluster/n1-hgx-pcie-switch-2", "cluster/n1-hgx-pcie-switch-3", "cluster/n1-hgx-pcie-switch-4", "cluster/n1-hgx-pcie-switch-5", "cluster/n1-hgx-pcie-switch-6", "cluster/n1-hgx-pcie-switch-7", "cluster/n1-intel-xeon-6767p-0", "cluster/n1-intel-xeon-6767p-1", "cluster/n1-mellanox-cx7-0", "cluster/n1-mellanox-cx7-1", "cluster/n1-mellanox-cx7-2", "cluster/n1-mellanox-cx7-3", "cluster/n1-mellanox-cx7-4", "cluster/n1-mellanox-cx7-5", "cluster/n1-mellanox-cx7-6", "cluster/n1-mellanox-cx7-7", "cluster/n1-nvidia-h200-sxm-0", "cluster/n1-nvidia-h200-sxm-1", "cluster/n1-nvidia-h200-sxm-2", "cluster/n1-nvidia-h200-sxm-3", "cluster/n1-nvidia-h200-sxm-4", "cluster/n1-nvidia-h200-sxm-5", "cluster/n1-nvidia-h200-sxm-6", "cluster/n1-nvidia-h200-sxm-7", "cluster/n1-nvswitch", "cluster/n1-ssd-0", "cluster/n1-ssd-1", "cluster/n1-ssd-2", "cluster/n1-ssd-3", "cluster/n1-ssd-4", "cluster/n1-ssd-5", "cluster/n1-ssd-6", "cluster/n1-ssd-7", "cluster/n2-ddr5-0", "cluster/n2-ddr5-1", "cluster/n2-hbm3e-0", "cluster/n2-hbm3e-1", "cluster/n2-hbm3e-2", "cluster/n2-hbm3e-3", "cluster/n2-hbm3e-4", "cluster/n2-hbm3e-5", "cluster/n2-hbm3e-6", "cluster/n2-hbm3e-7", "cluster/n2-hgx-pcie-switch-0", "cluster/n2-hgx-pcie-switch-1", "cluster/n2-hgx-pcie-switch-2", "cluster/n2-hgx-pcie-switch-3", "cluster/n2-hgx-pcie-switch-4", "cluster/n2-hgx-pcie-switch-5", "cluster/n2-hgx-pcie-switch-6", "cluster/n2-hgx-pcie-switch-7", "cluster/n2-intel-xeon-6767p-0", "cluster/n2-intel-xeon-6767p-1", "cluster/n2-mellanox-cx7-0", "cluster/n2-mellanox-cx7-1", "cluster/n2-mellanox-cx7-2", "cluster/n2-mellanox-cx7-3", "cluster/n2-mellanox-cx7-4", "cluster/n2-mellanox-cx7-5", "cluster/n2-mellanox-cx7-6", "cluster/n2-mellanox-cx7-7", "cluster/n2-nvidia-h200-sxm-0", "cluster/n2-nvidia-h200-sxm-1", "cluster/n2-nvidia-h200-sxm-2", "cluster/n2-nvidia-h200-sxm-3", "cluster/n2-nvidia-h200-sxm-4", "cluster/n2-nvidia-h200-sxm-5", "cluster/n2-nvidia-h200-sxm-6", "cluster/n2-nvidia-h200-sxm-7", "cluster/n2-nvswitch", "cluster/n2-ssd-0", "cluster/n2-ssd-1", "cluster/n2-ssd-2", "cluster/n2-ssd-3", "cluster/n2-ssd-4", "cluster/n2-ssd-5", "cluster/n2-ssd-6", "cluster/n2-ssd-7", "cluster/n3-ddr5-0", "cluster/n3-ddr5-1", "cluster/n3-hbm3e-0", "cluster/n3-hbm3e-1", "cluster/n3-hbm3e-2", "cluster/n3-hbm3e-3", "cluster/n3-hbm3e-4", "cluster/n3-hbm3e-5", "cluster/n3-hbm3e-6", "cluster/n3-hbm3e-7", "cluster/n3-hgx-pcie-switch-0", "cluster/n3-hgx-pcie-switch-1", "cluster/n3-hgx-pcie-switch-2", "cluster/n3-hgx-pcie-switch-3", "cluster/n3-hgx-pcie-switch-4", "cluster/n3-hgx-pcie-switch-5", "cluster/n3-hgx-pcie-switch-6", "cluster/n3-hgx-pcie-switch-7", "cluster/n3-intel-xeon-6767p-0", "cluster/n3-intel-xeon-6767p-1", "cluster/n3-mellanox-cx7-0", "cluster/n3-mellanox-cx7-1", "cluster/n3-mellanox-cx7-2", "cluster/n3-mellanox-cx7-3", "cluster/n3-mellanox-cx7-4", "cluster/n3-mellanox-cx7-5", "cluster/n3-mellanox-cx7-6", "cluster/n3-mellanox-cx7-7", "cluster/n3-nvidia-h200-sxm-0", "cluster/n3-nvidia-h200-sxm-1", "cluster/n3-nvidia-h200-sxm-2", "cluster/n3-nvidia-h200-sxm-3", "cluster/n3-nvidia-h200-sxm-4", "cluster/n3-nvidia-h200-sxm-5", "cluster/n3-nvidia-h200-sxm-6", "cluster/n3-nvidia-h200-sxm-7", "cluster/n3-nvswitch", "cluster/n3-ssd-0", "cluster/n3-ssd-1", "cluster/n3-ssd-2", "cluster/n3-ssd-3", "cluster/n3-ssd-4", "cluster/n3-ssd-5", "cluster/n3-ssd-6", "cluster/n3-ssd-7"]
+shards = 4
+prefill_groups = [[[29, 30], [31, 32], [33, 34], [35, 36]], [[74, 75], [76, 77], [78, 79], [80, 81]]]
+decode_groups = [[[119, 120], [121, 122], [123, 124], [125, 126]], [[164, 165], [166, 167], [168, 169], [170, 171]]]
+
+[[system.kv_topology.links]]
+src = 29
+dst = 11
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-0|cluster/n0-hgx-pcie-switch-0|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 11
+dst = 21
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-0|cluster/n0-hgx-pcie-switch-0|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 21
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-0|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 111
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-0|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 111
+dst = 101
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-0|cluster/n2-hgx-pcie-switch-0|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 101
+dst = 119
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-0|cluster/n2-hgx-pcie-switch-0|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 112
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-1|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 112
+dst = 102
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-1|cluster/n2-hgx-pcie-switch-1|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 102
+dst = 120
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-1|cluster/n2-hgx-pcie-switch-1|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 113
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-2|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 113
+dst = 103
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-2|cluster/n2-hgx-pcie-switch-2|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 103
+dst = 121
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-2|cluster/n2-hgx-pcie-switch-2|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 114
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-3|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 114
+dst = 104
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-3|cluster/n2-hgx-pcie-switch-3|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 104
+dst = 122
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-3|cluster/n2-hgx-pcie-switch-3|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 115
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-4|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 115
+dst = 105
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-4|cluster/n2-hgx-pcie-switch-4|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 105
+dst = 123
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-4|cluster/n2-hgx-pcie-switch-4|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 116
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-5|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 116
+dst = 106
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-5|cluster/n2-hgx-pcie-switch-5|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 106
+dst = 124
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-5|cluster/n2-hgx-pcie-switch-5|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 117
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-6|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 117
+dst = 107
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-6|cluster/n2-hgx-pcie-switch-6|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 107
+dst = 125
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-6|cluster/n2-hgx-pcie-switch-6|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 118
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n2-mellanox-cx7-7|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 118
+dst = 108
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-mellanox-cx7-7|cluster/n2-hgx-pcie-switch-7|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 108
+dst = 126
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n2-nvidia-h200-sxm-7|cluster/n2-hgx-pcie-switch-7|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 156
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-0|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 156
+dst = 146
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-0|cluster/n3-hgx-pcie-switch-0|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 146
+dst = 164
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-0|cluster/n3-hgx-pcie-switch-0|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 157
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-1|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 157
+dst = 147
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-1|cluster/n3-hgx-pcie-switch-1|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 147
+dst = 165
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-1|cluster/n3-hgx-pcie-switch-1|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 158
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-2|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 158
+dst = 148
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-2|cluster/n3-hgx-pcie-switch-2|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 148
+dst = 166
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-2|cluster/n3-hgx-pcie-switch-2|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 159
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-3|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 159
+dst = 149
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-3|cluster/n3-hgx-pcie-switch-3|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 149
+dst = 167
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-3|cluster/n3-hgx-pcie-switch-3|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 160
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-4|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 160
+dst = 150
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-4|cluster/n3-hgx-pcie-switch-4|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 150
+dst = 168
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-4|cluster/n3-hgx-pcie-switch-4|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 161
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-5|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 161
+dst = 151
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-5|cluster/n3-hgx-pcie-switch-5|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 151
+dst = 169
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-5|cluster/n3-hgx-pcie-switch-5|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 162
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-6|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 162
+dst = 152
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-6|cluster/n3-hgx-pcie-switch-6|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 152
+dst = 170
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-6|cluster/n3-hgx-pcie-switch-6|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 0
+dst = 163
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n3-mellanox-cx7-7|cluster/ib-switch|infiniband|rev"
+
+[[system.kv_topology.links]]
+src = 163
+dst = 153
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-mellanox-cx7-7|cluster/n3-hgx-pcie-switch-7|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 153
+dst = 171
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n3-nvidia-h200-sxm-7|cluster/n3-hgx-pcie-switch-7|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 30
+dst = 12
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-1|cluster/n0-hgx-pcie-switch-1|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 12
+dst = 22
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-1|cluster/n0-hgx-pcie-switch-1|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 22
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-1|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 31
+dst = 13
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-2|cluster/n0-hgx-pcie-switch-2|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 13
+dst = 23
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-2|cluster/n0-hgx-pcie-switch-2|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 23
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-2|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 32
+dst = 14
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-3|cluster/n0-hgx-pcie-switch-3|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 14
+dst = 24
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-3|cluster/n0-hgx-pcie-switch-3|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 24
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-3|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 33
+dst = 15
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-4|cluster/n0-hgx-pcie-switch-4|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 15
+dst = 25
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-4|cluster/n0-hgx-pcie-switch-4|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 25
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-4|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 34
+dst = 16
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-5|cluster/n0-hgx-pcie-switch-5|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 16
+dst = 26
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-5|cluster/n0-hgx-pcie-switch-5|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 26
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-5|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 35
+dst = 17
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-6|cluster/n0-hgx-pcie-switch-6|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 17
+dst = 27
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-6|cluster/n0-hgx-pcie-switch-6|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 27
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-6|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 36
+dst = 18
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-nvidia-h200-sxm-7|cluster/n0-hgx-pcie-switch-7|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 18
+dst = 28
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n0-mellanox-cx7-7|cluster/n0-hgx-pcie-switch-7|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 28
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n0-mellanox-cx7-7|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 74
+dst = 56
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-0|cluster/n1-hgx-pcie-switch-0|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 56
+dst = 66
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-0|cluster/n1-hgx-pcie-switch-0|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 66
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-0|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 75
+dst = 57
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-1|cluster/n1-hgx-pcie-switch-1|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 57
+dst = 67
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-1|cluster/n1-hgx-pcie-switch-1|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 67
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-1|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 76
+dst = 58
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-2|cluster/n1-hgx-pcie-switch-2|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 58
+dst = 68
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-2|cluster/n1-hgx-pcie-switch-2|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 68
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-2|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 77
+dst = 59
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-3|cluster/n1-hgx-pcie-switch-3|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 59
+dst = 69
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-3|cluster/n1-hgx-pcie-switch-3|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 69
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-3|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 78
+dst = 60
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-4|cluster/n1-hgx-pcie-switch-4|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 60
+dst = 70
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-4|cluster/n1-hgx-pcie-switch-4|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 70
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-4|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 79
+dst = 61
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-5|cluster/n1-hgx-pcie-switch-5|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 61
+dst = 71
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-5|cluster/n1-hgx-pcie-switch-5|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 71
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-5|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 80
+dst = 62
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-6|cluster/n1-hgx-pcie-switch-6|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 62
+dst = 72
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-6|cluster/n1-hgx-pcie-switch-6|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 72
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-6|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.links]]
+src = 81
+dst = 63
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-nvidia-h200-sxm-7|cluster/n1-hgx-pcie-switch-7|pcie|fwd"
+
+[[system.kv_topology.links]]
+src = 63
+dst = 73
+bandwidth = 64000000000.0
+latency = 5e-07
+resource = "fabric:cluster/n1-mellanox-cx7-7|cluster/n1-hgx-pcie-switch-7|pcie|rev"
+
+[[system.kv_topology.links]]
+src = 73
+dst = 0
+bandwidth = 50000000000.0
+latency = 1e-06
+resource = "fabric:cluster/n1-mellanox-cx7-7|cluster/ib-switch|infiniband|fwd"
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 119
+links = [0, 1, 2, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 120
+links = [0, 1, 2, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 121
+links = [0, 1, 2, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 122
+links = [0, 1, 2, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 123
+links = [0, 1, 2, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 124
+links = [0, 1, 2, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 125
+links = [0, 1, 2, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 126
+links = [0, 1, 2, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 164
+links = [0, 1, 2, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 165
+links = [0, 1, 2, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 166
+links = [0, 1, 2, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 167
+links = [0, 1, 2, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 168
+links = [0, 1, 2, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 169
+links = [0, 1, 2, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 170
+links = [0, 1, 2, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 29
+dst = 171
+links = [0, 1, 2, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 119
+links = [51, 52, 53, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 120
+links = [51, 52, 53, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 121
+links = [51, 52, 53, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 122
+links = [51, 52, 53, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 123
+links = [51, 52, 53, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 124
+links = [51, 52, 53, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 125
+links = [51, 52, 53, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 126
+links = [51, 52, 53, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 164
+links = [51, 52, 53, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 165
+links = [51, 52, 53, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 166
+links = [51, 52, 53, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 167
+links = [51, 52, 53, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 168
+links = [51, 52, 53, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 169
+links = [51, 52, 53, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 170
+links = [51, 52, 53, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 30
+dst = 171
+links = [51, 52, 53, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 119
+links = [54, 55, 56, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 120
+links = [54, 55, 56, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 121
+links = [54, 55, 56, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 122
+links = [54, 55, 56, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 123
+links = [54, 55, 56, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 124
+links = [54, 55, 56, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 125
+links = [54, 55, 56, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 126
+links = [54, 55, 56, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 164
+links = [54, 55, 56, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 165
+links = [54, 55, 56, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 166
+links = [54, 55, 56, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 167
+links = [54, 55, 56, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 168
+links = [54, 55, 56, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 169
+links = [54, 55, 56, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 170
+links = [54, 55, 56, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 31
+dst = 171
+links = [54, 55, 56, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 119
+links = [57, 58, 59, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 120
+links = [57, 58, 59, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 121
+links = [57, 58, 59, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 122
+links = [57, 58, 59, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 123
+links = [57, 58, 59, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 124
+links = [57, 58, 59, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 125
+links = [57, 58, 59, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 126
+links = [57, 58, 59, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 164
+links = [57, 58, 59, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 165
+links = [57, 58, 59, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 166
+links = [57, 58, 59, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 167
+links = [57, 58, 59, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 168
+links = [57, 58, 59, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 169
+links = [57, 58, 59, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 170
+links = [57, 58, 59, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 32
+dst = 171
+links = [57, 58, 59, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 119
+links = [60, 61, 62, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 120
+links = [60, 61, 62, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 121
+links = [60, 61, 62, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 122
+links = [60, 61, 62, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 123
+links = [60, 61, 62, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 124
+links = [60, 61, 62, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 125
+links = [60, 61, 62, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 126
+links = [60, 61, 62, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 164
+links = [60, 61, 62, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 165
+links = [60, 61, 62, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 166
+links = [60, 61, 62, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 167
+links = [60, 61, 62, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 168
+links = [60, 61, 62, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 169
+links = [60, 61, 62, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 170
+links = [60, 61, 62, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 33
+dst = 171
+links = [60, 61, 62, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 119
+links = [63, 64, 65, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 120
+links = [63, 64, 65, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 121
+links = [63, 64, 65, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 122
+links = [63, 64, 65, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 123
+links = [63, 64, 65, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 124
+links = [63, 64, 65, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 125
+links = [63, 64, 65, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 126
+links = [63, 64, 65, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 164
+links = [63, 64, 65, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 165
+links = [63, 64, 65, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 166
+links = [63, 64, 65, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 167
+links = [63, 64, 65, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 168
+links = [63, 64, 65, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 169
+links = [63, 64, 65, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 170
+links = [63, 64, 65, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 34
+dst = 171
+links = [63, 64, 65, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 119
+links = [66, 67, 68, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 120
+links = [66, 67, 68, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 121
+links = [66, 67, 68, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 122
+links = [66, 67, 68, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 123
+links = [66, 67, 68, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 124
+links = [66, 67, 68, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 125
+links = [66, 67, 68, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 126
+links = [66, 67, 68, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 164
+links = [66, 67, 68, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 165
+links = [66, 67, 68, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 166
+links = [66, 67, 68, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 167
+links = [66, 67, 68, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 168
+links = [66, 67, 68, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 169
+links = [66, 67, 68, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 170
+links = [66, 67, 68, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 35
+dst = 171
+links = [66, 67, 68, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 119
+links = [69, 70, 71, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 120
+links = [69, 70, 71, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 121
+links = [69, 70, 71, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 122
+links = [69, 70, 71, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 123
+links = [69, 70, 71, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 124
+links = [69, 70, 71, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 125
+links = [69, 70, 71, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 126
+links = [69, 70, 71, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 164
+links = [69, 70, 71, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 165
+links = [69, 70, 71, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 166
+links = [69, 70, 71, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 167
+links = [69, 70, 71, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 168
+links = [69, 70, 71, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 169
+links = [69, 70, 71, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 170
+links = [69, 70, 71, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 36
+dst = 171
+links = [69, 70, 71, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 119
+links = [72, 73, 74, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 120
+links = [72, 73, 74, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 121
+links = [72, 73, 74, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 122
+links = [72, 73, 74, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 123
+links = [72, 73, 74, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 124
+links = [72, 73, 74, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 125
+links = [72, 73, 74, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 126
+links = [72, 73, 74, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 164
+links = [72, 73, 74, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 165
+links = [72, 73, 74, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 166
+links = [72, 73, 74, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 167
+links = [72, 73, 74, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 168
+links = [72, 73, 74, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 169
+links = [72, 73, 74, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 170
+links = [72, 73, 74, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 74
+dst = 171
+links = [72, 73, 74, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 119
+links = [75, 76, 77, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 120
+links = [75, 76, 77, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 121
+links = [75, 76, 77, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 122
+links = [75, 76, 77, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 123
+links = [75, 76, 77, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 124
+links = [75, 76, 77, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 125
+links = [75, 76, 77, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 126
+links = [75, 76, 77, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 164
+links = [75, 76, 77, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 165
+links = [75, 76, 77, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 166
+links = [75, 76, 77, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 167
+links = [75, 76, 77, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 168
+links = [75, 76, 77, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 169
+links = [75, 76, 77, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 170
+links = [75, 76, 77, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 75
+dst = 171
+links = [75, 76, 77, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 119
+links = [78, 79, 80, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 120
+links = [78, 79, 80, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 121
+links = [78, 79, 80, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 122
+links = [78, 79, 80, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 123
+links = [78, 79, 80, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 124
+links = [78, 79, 80, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 125
+links = [78, 79, 80, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 126
+links = [78, 79, 80, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 164
+links = [78, 79, 80, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 165
+links = [78, 79, 80, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 166
+links = [78, 79, 80, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 167
+links = [78, 79, 80, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 168
+links = [78, 79, 80, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 169
+links = [78, 79, 80, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 170
+links = [78, 79, 80, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 76
+dst = 171
+links = [78, 79, 80, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 119
+links = [81, 82, 83, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 120
+links = [81, 82, 83, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 121
+links = [81, 82, 83, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 122
+links = [81, 82, 83, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 123
+links = [81, 82, 83, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 124
+links = [81, 82, 83, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 125
+links = [81, 82, 83, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 126
+links = [81, 82, 83, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 164
+links = [81, 82, 83, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 165
+links = [81, 82, 83, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 166
+links = [81, 82, 83, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 167
+links = [81, 82, 83, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 168
+links = [81, 82, 83, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 169
+links = [81, 82, 83, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 170
+links = [81, 82, 83, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 77
+dst = 171
+links = [81, 82, 83, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 119
+links = [84, 85, 86, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 120
+links = [84, 85, 86, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 121
+links = [84, 85, 86, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 122
+links = [84, 85, 86, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 123
+links = [84, 85, 86, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 124
+links = [84, 85, 86, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 125
+links = [84, 85, 86, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 126
+links = [84, 85, 86, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 164
+links = [84, 85, 86, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 165
+links = [84, 85, 86, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 166
+links = [84, 85, 86, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 167
+links = [84, 85, 86, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 168
+links = [84, 85, 86, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 169
+links = [84, 85, 86, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 170
+links = [84, 85, 86, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 78
+dst = 171
+links = [84, 85, 86, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 119
+links = [87, 88, 89, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 120
+links = [87, 88, 89, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 121
+links = [87, 88, 89, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 122
+links = [87, 88, 89, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 123
+links = [87, 88, 89, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 124
+links = [87, 88, 89, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 125
+links = [87, 88, 89, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 126
+links = [87, 88, 89, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 164
+links = [87, 88, 89, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 165
+links = [87, 88, 89, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 166
+links = [87, 88, 89, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 167
+links = [87, 88, 89, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 168
+links = [87, 88, 89, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 169
+links = [87, 88, 89, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 170
+links = [87, 88, 89, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 79
+dst = 171
+links = [87, 88, 89, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 119
+links = [90, 91, 92, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 120
+links = [90, 91, 92, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 121
+links = [90, 91, 92, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 122
+links = [90, 91, 92, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 123
+links = [90, 91, 92, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 124
+links = [90, 91, 92, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 125
+links = [90, 91, 92, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 126
+links = [90, 91, 92, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 164
+links = [90, 91, 92, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 165
+links = [90, 91, 92, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 166
+links = [90, 91, 92, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 167
+links = [90, 91, 92, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 168
+links = [90, 91, 92, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 169
+links = [90, 91, 92, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 170
+links = [90, 91, 92, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 80
+dst = 171
+links = [90, 91, 92, 48, 49, 50]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 119
+links = [93, 94, 95, 3, 4, 5]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 120
+links = [93, 94, 95, 6, 7, 8]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 121
+links = [93, 94, 95, 9, 10, 11]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 122
+links = [93, 94, 95, 12, 13, 14]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 123
+links = [93, 94, 95, 15, 16, 17]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 124
+links = [93, 94, 95, 18, 19, 20]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 125
+links = [93, 94, 95, 21, 22, 23]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 126
+links = [93, 94, 95, 24, 25, 26]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 164
+links = [93, 94, 95, 27, 28, 29]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 165
+links = [93, 94, 95, 30, 31, 32]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 166
+links = [93, 94, 95, 33, 34, 35]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 167
+links = [93, 94, 95, 36, 37, 38]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 168
+links = [93, 94, 95, 39, 40, 41]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 169
+links = [93, 94, 95, 42, 43, 44]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 170
+links = [93, 94, 95, 45, 46, 47]
+
+[[system.kv_topology.routes]]
+src = 81
+dst = 171
+links = [93, 94, 95, 48, 49, 50]

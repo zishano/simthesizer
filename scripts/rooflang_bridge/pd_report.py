@@ -18,8 +18,14 @@ def export_transfers(output, system):
     routes = {(r["src"], r["dst"]): r for r in topology["routes"]} if topology else {}
     owners = {}
     if topology:
-        for pool, prefix in [("prefill_gpus", "p"), ("decode_gpus", "d")]:
-            for index, group in enumerate(topology[pool]):
+        for side, prefix in [("prefill", "p"), ("decode", "d")]:
+            replicas = topology.get(f"{side}_gpus")
+            if replicas is None:
+                replicas = [
+                    [gpu for group in groups for gpu in group]
+                    for groups in topology[f"{side}_groups"]
+                ]
+            for index, group in enumerate(replicas):
                 owners.update({gpu: f"{prefix}{index}" for gpu in group})
         (output / "kv-topology.json").write_text(json.dumps(topology, indent=2) + "\n")
         spec = system["prefill_instances"][0]["model_runner"]["hardware"]["topology"]

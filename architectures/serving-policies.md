@@ -10,6 +10,21 @@ observations and bounded trial-local memory, without mutable graph/resource stat
 The executor validates identities, budgets, token progress and future wake times.
 Batch completion commits by stable completion-node ID, including reordered batches.
 
+Candidate observations include a lazy read-only environment view. Resource and
+KV owners derive remaining service demand, allocated capacity and registered
+unmet reads only on explicit queries. Service demand is not utilization; reads
+of an expanded batch are not necessarily current stalls. Request plans and mutable
+owners stay private; allocated capacity retains the `known_trace` reservation
+assumption. Optional decision samples are bounded and disabled
+by default; the reference path remains unchanged. See the
+[search guide](../agents/find_pareto_frontier/SEARCH.md) for seeds and diagnostics.
+
+Optional offline tools render composable scheduling candidates and their controls.
+The search planner derives case coverage and promotion suggestions from checked
+receipts and complete native results. It neither runs trials nor changes the
+evaluator's budget, metrics or verification boundary. Generated recipes are
+starting hypotheses; arbitrary legal candidate programs remain supported.
+
 Waiting uses registered logical events. A full KV window waits for ACK rather than
 polling. Pending transfers pin their source until ACK; sending does not pin twice.
 Decode reads wait on held conditions indexed by request/layer/rank/token coverage.

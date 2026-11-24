@@ -13,3 +13,5 @@ __pycache__
 # development environments
 .devenv*
 .venv/
+
+/report/

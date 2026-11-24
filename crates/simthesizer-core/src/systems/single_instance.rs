@@ -406,6 +406,10 @@ impl LogicalHandler for SingleInstanceSystem {
                         let (default_token_budget, default_max_batch) =
                             self.scheduler.policy_defaults()?;
                         let observation = BatchObservation {
+                            environment: Some(crate::policies::EnvironmentObservation::new(
+                                &graph.resources,
+                                &graph.kv,
+                            )),
                             now,
                             instance: *instance,
                             requests: &requests,
@@ -526,7 +530,7 @@ impl System for SingleInstanceSystem {
 
     fn init(&mut self) -> Result<()> {
         let parallel = self.model_runner.parallel_strategy();
-        self.model.init(parallel)?;
+        self.model_runner.init_model(self.model.as_mut())?;
         self.scheduler.init(
             self.model.scheduler_model_weight_bytes(),
             self.model.scheduler_kv_bytes_per_request(),

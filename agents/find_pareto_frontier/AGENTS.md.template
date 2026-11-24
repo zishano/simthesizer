@@ -30,6 +30,24 @@ may screen ideas but do not establish dynamic policy support. Search P chunking,
 batch selection and waiting, pending KV transmission, and routing where multiple
 instances exist. Unsupported mechanisms are proposals, not scored shortcuts.
 
+Maintain `artifacts/search-coverage.json`: strategy families, hypotheses,
+candidate IDs, completed case IDs, ablations, findings and untested reasons.
+Explore dynamic P chunking, Decode fairness/batching, KV order/concurrency and
+their interactions; explore routing only where instances offer a real choice.
+Allocate remaining budget across untested families as well as refinements.
+Do not exhaust it on adjacent static parameters while feasible families remain.
+The coverage ledger is an index; evaluator receipts remain the result authority.
+Use the frozen `search_space.py` to create an opt-in catalog under artifacts and
+`search_plan.py --manifest {{MANIFEST_PATH}} --catalog PATH --output
+{{ARTIFACTS_DIRECTORY}}/search-plan.json` to reconstruct coverage from receipts.
+See the frozen `SEARCH.md` for commands. Keep authored hypotheses separate from
+this generated report. The planner suggests one case; it runs no simulations,
+changes no budget and cannot verify results. Install its exact suggested source
+before evaluation. Inspect rejected evidence and unfinished attempts first.
+Use component-removal and static controls on matching cases. Skip routing when
+neither pool offers a choice. Recipes do not restrict policy synthesis: expand
+parameters, combinations and new legal Rust rules after the starter catalog.
+
 ## Modification and observation boundary
 
 Only candidate policy source/parameters and search artifacts are writable task
@@ -56,7 +74,9 @@ artifacts.
    A resumed invocation has a fresh conversation: reconstruct context from
    artifacts instead of restarting completed experiments.
 2. Record a falsifiable hypothesis, expected bottleneck, proposed change and
-   matching cases. Freeze the candidate source and parameters before evaluation.
+   matching cases. Name its family, parent candidate, causal observations,
+   dynamic branch and expected regressions. Separate observation from estimates.
+   Freeze the candidate source and parameters before evaluation.
 3. Run syntax/build and focused correctness checks, then complete simulations
    through the trusted evaluator. Never manufacture a passing record.
 4. Compare identical cases. Record joint SLO pass rate, goodput, latency tails,
@@ -64,8 +84,16 @@ artifacts.
    successful low score. One-token TPOT is unavailable, not zero.
 5. Promote promising candidates through the prescribed case matrix. Retain
    distinct tradeoffs with their exact code, parameters and reproduction data.
+   Screen on selected complete training cases, then evaluate promising candidates
+   on the required training/validation matrix. Reserve budget for this promotion
+   and component ablations; a screened point is not full-matrix coverage. Compare
+   dynamic winners with matched static controls or disabled components to locate
+   their gains. Update family coverage from actual receipts after each trial.
 6. Use bounded diagnostics for winners/failures. Preserve results, metrics,
    plots and compact causal evidence; collect full graphs only when requested.
+   Use only capabilities and diagnostic budgets in the frozen runtime. Remaining
+   resource work is not measured utilization; registered KV read gates do not
+   establish a critical path. Account for callback cost and evaluation wall time.
 7. Continue while external budgets permit. Supervise child processes; account
    for exit, OOM, stalls and interruption. Never finish with required work hidden
    in the background.
@@ -89,5 +117,6 @@ identity checks.
 Report tested cases, completed-request counts, SLO thresholds/pass fractions,
 frontier coordinates and policy IDs, gains/retained tradeoffs, regressions,
 failures, model assumptions, verification coverage and actual search cost.
+Include dynamic-family coverage, ablation evidence and incomplete promotions.
 Distinguish simulated gains from measured hardware performance. No improvement
 is a valid outcome; preserve the baseline and all useful evidence.

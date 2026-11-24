@@ -87,7 +87,7 @@ details{border-top:1px solid #e4e9f0;margin-top:7px;padding-top:6px}summary{curs
    <div class="main-column">
     <section class="timeline-panel">
     <div class="row timeline-tools"><h2>全局时间线</h2><span id="completed" class="muted"></span><span class="spacer"></span><label>行高 <select id="rowSize"><option value="fit">适应视窗</option><option value="full">展开分片</option></select></label><label>横向 <select id="zoom"><option>1</option><option>2</option><option>4</option><option>8</option><option>16</option><option>32</option></select> ×</label><button id="fit">全程</button><button id="focus">聚焦所选</button></div>
-    <div class="legend"><span><i style="background:var(--p)"></i>P 算子</span><span><i style="background:var(--d)"></i>D 算子</span><span><i style="background:var(--tp)"></i>TP 通信</span><span><i style="background:var(--kv)"></i>KV 传输</span><span><i style="background:var(--active)"></i>执行中</span><span>斜线：显存准入等待；浅色：未来；灰细线：当前时刻</span></div>
+    <div class="legend"><span><i style="background:var(--p)"></i>P 算子</span><span><i style="background:var(--d)"></i>D 算子</span><span><i style="background:var(--tp)"></i>组内通信（TP/EP）</span><span><i style="background:var(--kv)"></i>KV 传输</span><span><i style="background:var(--active)"></i>执行中</span><span>斜线：显存准入等待；浅色：未来；灰细线：当前时刻</span></div>
     <div id="timeline" class="scroll"></div>
     <small class="hint" title="右侧详情和下方节点 / 依赖图统一跟随时间线，取消勾选可自由浏览。时间轴为相对请求到达的毫秒；展开分片可逐条查看并发 KV。">右侧与下方统一跟随时间线；取消勾选可自由浏览。点击条目查看详情，并发 KV 可展开分片。</small>
     </section>
@@ -103,7 +103,7 @@ details{border-top:1px solid #e4e9f0;margin-top:7px;padding-top:6px}summary{curs
         <span id="nodeCount" title="筛选只作用于节点列表，保留所有轮次；所有原始节点均可翻页查看。"></span>
       </nav>
       <div id="nodes-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-nodes">
-        <div class="row filters"><input id="query" placeholder="节点 ID / 算子名"><select id="kind"><option value="">全部类型</option><option value="schedule">调度逻辑</option><option value="boundary">轮次边界</option><option value="operator">计算 / HBM 算子</option><option value="tp">TP 通信</option><option value="kv">KV 传输</option><option value="kv_state">KV 读写 / 确认</option></select><select id="moduleFilter" aria-label="模块筛选"><option value="">全部模块</option></select><select id="instance"><option value="">全部实例</option></select><select id="request"><option value="">全部请求</option></select><input id="layer" type="number" min="0" placeholder="层编号"><button id="clear">清除筛选</button><span class="spacer"></span><span style="white-space:nowrap"><button id="prevPage">上一页</button><span id="page"></span><button id="nextPage">下一页</button></span></div>
+        <div class="row filters"><input id="query" placeholder="节点 ID / 算子名"><select id="kind"><option value="">全部类型</option><option value="schedule">调度逻辑</option><option value="boundary">轮次边界</option><option value="operator">计算 / HBM 算子</option><option value="tp">组内通信（TP/EP）</option><option value="kv">KV 传输</option><option value="kv_state">KV 读写 / 确认</option></select><select id="moduleFilter" aria-label="模块筛选"><option value="">全部模块</option></select><select id="instance"><option value="">全部实例</option></select><select id="request"><option value="">全部请求</option></select><input id="layer" type="number" min="0" placeholder="层编号"><button id="clear">清除筛选</button><span class="spacer"></span><span style="white-space:nowrap"><button id="prevPage">上一页</button><span id="page"></span><button id="nextPage">下一页</button></span></div>
         <div id="nodeTable" class="scroll"></div>
       </div>
       <div id="modules-panel" class="tab-panel stack" role="tabpanel" aria-labelledby="tab-modules" hidden>
@@ -134,7 +134,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const nodes=new Map(data.nodes.map(n=>[n.id,n])), rounds=new Map(data.rounds.map(r=>[r.key,r]));
 const incoming=new Map(),outgoing=new Map();
 for(const e of data.edges){if(!incoming.has(e.child))incoming.set(e.child,[]);if(!outgoing.has(e.parent))outgoing.set(e.parent,[]);incoming.get(e.child).push(e);outgoing.get(e.parent).push(e);}
-const category={schedule:'调度',boundary:'轮次',operator:'算子',tp:'TP',kv:'KV 传输',kv_state:'KV 状态'};
+const category={schedule:'调度',boundary:'轮次',operator:'算子',tp:'组内通信',kv:'KV 传输',kv_state:'KV 状态'};
 const color={p:'#2563b4',d:'#7657be',kv:'#137b64',tp:'#c06d15',schedule:'#65758a'};
 const ops=data.nodes.filter(n=>['operator','tp'].includes(n.view.category)), copies=data.nodes.filter(n=>n.view.category==='kv');
 const step=$('step');step.max=data.times.length-1;
@@ -183,7 +183,7 @@ function makeLanes(){
   for(const i of data.instances.filter(i=>i.side===side)){
    lanes.push({label:`${i.id} · batch`,rounds:data.rounds.filter(r=>r.instance===i.id),height:30});
    for(const device of i.devices)lanes.push({label:`${i.id} / ${gpu(device)} · 算子`,title:device,items:ops.filter(n=>n.view.instance===i.id&&n.view.category==='operator'&&n.view.devices.includes(device)).map(n=>({n,track:0})),height:28,tracks:1});
-   lanes.push({label:`${i.id} · TP 通信`,items:ops.filter(n=>n.view.instance===i.id&&n.view.category==='tp').map(n=>({n,track:0})),height:25,tracks:1});
+   lanes.push({label:`${i.id} · 组内通信（TP/EP）`,items:ops.filter(n=>n.view.instance===i.id&&n.view.category==='tp').map(n=>({n,track:0})),height:25,tracks:1});
   }
  }
  return lanes;
@@ -260,7 +260,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('modules-panel').
 function render(){const t=time();$('clock').textContent=`+${ms(t)} ms · t=${t.toFixed(9)} s`;$('step').title=`${+step.value+1}/${data.times.length} 个事件时刻`;$('completed').textContent=`请求完成 ${flowBound(flowModel.finishes,t,r=>r.finish)}/${data.requests.length}`;renderTimeline();renderState();renderTable();renderDetails();renderDependencies();renderModules();renderModuleDetails();}
 $('mode').textContent=`shared · ${data.meta.mode==='layer'?'逐层交接 layer':'整轮交接 whole'}`;
 $('coverage').textContent=`${data.nodes.length} 节点 · ${data.edges.length} 条历史依赖 · ${data.rounds.length} 轮`;
-$('deployment').textContent=data.instances.map(i=>`${i.id}：${i.gpu_model.toUpperCase()} × ${i.devices.length}，TP=${i.tp}，${i.devices.map(gpu).join('/') }，token_budget=${i.scheduler.max_num_batched_tokens}`).join('；');
+$('deployment').textContent=data.instances.map(i=>`${i.id}：${i.gpu_model.toUpperCase()} × ${i.devices.length}，TP=${i.tp}，EP=${i.ep??1}，${i.devices.map(gpu).join('/') }，token_budget=${i.scheduler.max_num_batched_tokens}`).join('；');
 $('inputInfo').textContent=`Workload：${data.meta.directory}/workload.jsonl · ${data.requests.length} 个请求 · ${data.meta.model.num_hidden_layers} 层 · 时间原点 ${data.meta.origin} s`;
 $('mode').title=data.meta.mode==='layer'?'逐层交接：P 的 attention 写完一层 KV 即可开始复制，与后续 P 计算重叠。D 在首 token 后开始调度，各层 attention 等待对应 KV。':'整轮交接：P 完成后启动各层 KV 分片复制。D 在首 token 后开始调度，各层 attention 仍按本层 KV 的就绪条件执行。';
 $('inputInfo').title=$('inputInfo').textContent;

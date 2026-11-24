@@ -71,7 +71,6 @@ def topology_pd_config(
     allow_gpu_sharing=False,
 ):
     """Compose independent pools; counts refer to total pool GPUs, not per replica."""
-    from rooflang_bridge.llama import KVH
     from rooflang_bridge.topology import (
         build_topology,
         default_topology,
@@ -81,22 +80,57 @@ def topology_pd_config(
 
     if allow_gpu_sharing and not shared_execution:
         raise ValueError("GPU sharing requires shared execution")
+    qwen = leaf["model"].get("kind") == "qwen3_235b_a22b"
+    if qwen:
+        if not shared_execution:
+            raise ValueError("Qwen3 EP requires shared execution")
+        # The native preset is the single authority for model dimensions.
+        import tomllib
+        from pathlib import Path
+
+        preset = (
+            Path(__file__).resolve().parents[2]
+            / "crates/simthesizer-core/src/models/qwen3_235b_a22b.toml"
+        )
+        shards = tomllib.loads(preset.read_text())["num_key_value_heads"]
+    else:
+        from rooflang_bridge.llama import KVH
+
+        shards = KVH
+
+    def width(pool):
+        return pool.get("ep", 1) if qwen else pool["tp"]
+
     pools = [prefill, decode]
     for pool in pools:
         if pool["tp"] not in (1, 2, 4, 8) or pool["instances"] < 1:
             raise ValueError("P/D requires positive instances and TP=1/2/4/8")
-        if pool.get("pp", 1) != 1 or pool.get("ep", 1) != 1:
-            raise ValueError("Rooflang currently supports PP=1 and EP=1 only")
-        expected = pool["instances"] * pool["tp"]
+        if qwen:
+            if (
+                pool["tp"] not in (1, 2, 4)
+                or pool.get("pp", 1) != 1
+                or pool.get("ep", 1) not in (1, 2, 4, 8)
+                or pool.get("ep", 1) % pool["tp"] != 0
+                or pool.get("expert_tp", 1) != 1
+            ):
+                raise ValueError(
+                    "Qwen3 shared requires Attention TP=1/2/4 dividing EP=1/2/4/8, "
+                    "PP=1 and expert TP=1"
+                )
+        elif pool.get("pp", 1) != 1 or pool.get("ep", 1) != 1:
+            raise ValueError("Llama Rooflang supports PP=1 and EP=1 only")
+        expected = pool["instances"] * width(pool)
         if pool.get("gpu_count", expected) != expected:
-            raise ValueError("pool gpu_count must equal instances * TP (PP=1)")
+            raise ValueError(
+                "pool gpu_count must equal instances * group width (Llama TP, Qwen EP)"
+            )
     if topology is None:
         if prefill["gpu_model"] != decode["gpu_model"]:
             raise ValueError(
                 "different GPU models require --hardware-topology with explicit bridge links"
             )
         topology = default_topology(
-            prefill["gpu_model"], sum(p["instances"] * p["tp"] for p in pools)
+            prefill["gpu_model"], sum(p["instances"] * width(p) for p in pools)
         )
     hw = build_topology(topology)
     available = sorted((d for d in hw.nodes if d.kind == "gpu"), key=device_order)
@@ -113,7 +147,7 @@ def topology_pd_config(
     for key, prefix, pool in zip(
         ["prefill_instances", "decode_instances"], ["p", "d"], pools
     ):
-        count = pool["instances"] * pool["tp"]
+        count = pool["instances"] * width(pool)
         names = pool.get("gpu_ids")
         if names is None:
             names = [
@@ -138,13 +172,16 @@ def topology_pd_config(
             directory = output / "instances" / identity
             child = copy.deepcopy(leaf)
             runner = child["model_runner"]
-            ids = names[index * pool["tp"] : (index + 1) * pool["tp"]]
+            ids = names[index * width(pool) : (index + 1) * width(pool)]
             if len(set(ids)) != len(ids):
                 raise ValueError("one TP group cannot repeat a GPU")
             gpu = [lookup[n] for n in ids]
-            hw.find_aggregate_bandwidth(
-                gpu
-            )  # Validate the collective scope before spawning workers.
+            if qwen:
+                for source in gpu:
+                    for target in gpu:
+                        hw.find_fabric_path_directed(source, target)
+            else:
+                hw.find_aggregate_bandwidth(gpu)
             capacities = {hw.find_local_memory(d).capacity_gb for d in gpu}
             if len(capacities) != 1:
                 raise ValueError("one TP group requires equal GPU memory capacities")
@@ -160,6 +197,16 @@ def topology_pd_config(
             )
             if shared_execution:
                 runner.update(shared_execution=True, stage=prefix)
+            if qwen:
+                runner.update(
+                    graph_model="qwen3_235b_a22b",
+                    ep=pool.get("ep", 1),
+                    expert_tp=1,
+                    attention_groups=[
+                        list(range(start, start + pool["tp"]))
+                        for start in range(0, len(ids), pool["tp"])
+                    ],
+                )
             command = runner["command"]
             if "--audit-dir" in command:
                 command[command.index("--audit-dir") + 1] = str(directory / "audit")
@@ -173,5 +220,16 @@ def topology_pd_config(
             allocated.append(ids)
             instances.append((identity, directory / "audit", directory))
         groups.append(allocated)
-    parent["kv_topology"] = kv_topology(hw, *groups, shards=KVH)
+    parent["kv_topology"] = kv_topology(hw, *groups, shards=shards)
+    if qwen:
+        # The runner layout is authoritative; KV uses its physical device mapping.
+        for side in ("prefill", "decode"):
+            replicas = parent["kv_topology"].pop(f"{side}_gpus")
+            parent["kv_topology"][f"{side}_groups"] = [
+                [
+                    [devices[rank] for rank in group]
+                    for group in child["model_runner"]["attention_groups"]
+                ]
+                for devices, child in zip(replicas, parent[f"{side}_instances"])
+            ]
     return {"system": parent}, instances

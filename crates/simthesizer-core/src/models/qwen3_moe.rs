@@ -228,13 +228,13 @@ impl Qwen3MoeModel {
         layers
     }
 
-    fn build_block_plans(&self, tp_size: u32) -> Vec<Vec<Layer>> {
+    fn build_block_plans(&self, tp_size: u32, expert_tp: u32) -> Vec<Vec<Layer>> {
         let attention_prefix = self.build_attention_prefix(tp_size);
         (0..self.num_hidden_layers)
             .map(|block_idx| {
                 let mut layers = attention_prefix.clone();
                 if self.is_sparse_layer(block_idx) {
-                    layers.extend(self.build_sparse_mlp_suffix(tp_size));
+                    layers.extend(self.build_sparse_mlp_suffix(expert_tp));
                 } else {
                     layers.extend(self.build_dense_mlp_suffix(tp_size));
                 }
@@ -312,14 +312,19 @@ impl Qwen3MoeModel {
         gate + shared + expert
     }
 
-    fn compute_weight_bytes_per_device(&self, parallel: ParallelStrategy) -> u64 {
+    fn compute_weight_bytes_per_device(
+        &self,
+        parallel: ParallelStrategy,
+        expert_tp: u32,
+        full_embedding: bool,
+    ) -> u64 {
         let tp = Self::tp_divisor(parallel.tp);
-        let embed = (self.vocab_size / tp) * self.hidden_size;
+        let embed = (self.vocab_size / if full_embedding { 1 } else { tp }) * self.hidden_size;
         let block = (0..self.num_hidden_layers)
             .map(|block_idx| {
                 self.attention_block_weight_elems(parallel.tp)
                     + if self.is_sparse_layer(block_idx) {
-                        self.sparse_mlp_weight_elems(parallel.tp, parallel.ep)
+                        self.sparse_mlp_weight_elems(expert_tp, parallel.ep)
                     } else {
                         self.dense_mlp_weight_elems(parallel.tp)
                     }
@@ -411,20 +416,47 @@ impl Qwen3MoeModel {
         }
         Ok(())
     }
+
+    fn initialize(&mut self, parallel: ParallelStrategy, expert_tp: u32, full_embedding: bool) {
+        self.pre_block_layers = self.build_pre_block_layers();
+        let block_plans = self.build_block_plans(parallel.tp, expert_tp);
+        (self.block_layers, self.block_count) = Self::build_repeated_block_plan(&block_plans);
+        self.post_block_layers = self.build_post_block_layers(parallel.tp);
+        self.weight_bytes_per_device =
+            self.compute_weight_bytes_per_device(parallel, expert_tp, full_embedding);
+        self.kv_bytes_per_token_per_device =
+            self.compute_kv_bytes_per_token_per_device(parallel.tp);
+        self.scheduler_kv_bytes_per_token = if full_embedding {
+            self.kv_bytes_per_token_per_device
+                .div_ceil(u64::from(parallel.ep / parallel.tp))
+        } else {
+            self.compute_scheduler_kv_bytes_per_token(parallel)
+        };
+    }
 }
 
 impl Model for Qwen3MoeModel {
     fn init(&mut self, parallel: ParallelStrategy) -> Result<()> {
         self.validate(parallel)?;
+        self.initialize(parallel, parallel.tp, false);
+        Ok(())
+    }
 
-        self.pre_block_layers = self.build_pre_block_layers();
-        let block_plans = self.build_block_plans(parallel.tp);
-        (self.block_layers, self.block_count) = Self::build_repeated_block_plan(&block_plans);
-        self.post_block_layers = self.build_post_block_layers(parallel.tp);
-        self.weight_bytes_per_device = self.compute_weight_bytes_per_device(parallel);
-        self.kv_bytes_per_token_per_device =
-            self.compute_kv_bytes_per_token_per_device(parallel.tp);
-        self.scheduler_kv_bytes_per_token = self.compute_scheduler_kv_bytes_per_token(parallel);
+    fn init_with_expert_tp(&mut self, parallel: ParallelStrategy, expert_tp: u32) -> Result<()> {
+        // Native profile runners retain their original TP=1 contract via init().
+        self.validate(ParallelStrategy { tp: 1, ..parallel })?;
+        anyhow::ensure!(expert_tp == 1, "Qwen shared supports expert_tp=1 only");
+        anyhow::ensure!(parallel.pp == 1, "Qwen shared supports PP=1 only");
+        anyhow::ensure!(
+            matches!(parallel.tp, 1 | 2 | 4)
+                && matches!(parallel.ep, 1 | 2 | 4 | 8)
+                && parallel.ep.is_multiple_of(parallel.tp)
+                && self.num_attention_heads.is_multiple_of(u64::from(parallel.tp))
+                && self.num_key_value_heads.is_multiple_of(u64::from(parallel.tp))
+                && self.vocab_size.is_multiple_of(u64::from(parallel.tp)),
+            "Qwen shared requires Attention TP=1/2/4 dividing EP and all head/vocabulary dimensions"
+        );
+        self.initialize(parallel, expert_tp, true);
         Ok(())
     }
 

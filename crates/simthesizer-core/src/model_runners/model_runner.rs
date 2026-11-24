@@ -24,6 +24,10 @@ pub trait ModelRunner: Module + LogicalHandler {
     }
     fn parallel_strategy(&self) -> ParallelStrategy;
 
+    fn init_model(&self, model: &mut dyn Model) -> Result<()> {
+        model.init(self.parallel_strategy())
+    }
+
     fn init(&mut self, _model: &dyn Model) -> Result<()> {
         Ok(())
     }

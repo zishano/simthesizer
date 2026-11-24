@@ -514,6 +514,10 @@ class Experiment:
         for key in ("length_model", "scheduler_cost"):
             if data.get(key) != self.config["model_assumptions"][key]:
                 raise ValueError(f"native model assumption differs: {key}")
+        if self.config["artifacts"].get("policy_diagnostics") is not None and (
+            "bounded-policy-samples-v1" not in data.get("diagnostic_features", [])
+        ):
+            raise ValueError("native binary does not support bounded policy samples")
         return data
 
     def derived(self, case):
@@ -536,6 +540,10 @@ class Experiment:
                 key: self.config["slo"][key] for key in ("ttft_limit_s", "tpot_limit_s")
             },
         }
+        if self.config["artifacts"].get("policy_diagnostics") is not None:
+            config["system"]["policy"]["diagnostics"] = copy.deepcopy(
+                self.config["artifacts"]["policy_diagnostics"]
+            )
         for pool in ("prefill_instances", "decode_instances"):
             for child in config["system"][pool]:
                 child["model_runner"]["command"] = [

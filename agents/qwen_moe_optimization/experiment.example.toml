@@ -1,0 +1,116 @@
+# 仅结构设计，尚无本目录解析器/launcher；不能传给旧 Llama launcher。
+# 全部运行字段属于拟议新协议。空字符串、空数组或零预算表示未配置，
+# 未来 --check 必须拒绝启动；不自动沿用 Llama SLO、费用或生产参数。
+schema_version = "qwen-mechanism-search-draft-v1"
+design_only = true
+enabled = false
+
+[reference]
+# 只读参数来源线索，不是自动冻结的实验输入。
+scenario_script = "run_qwen3_235b_shared_workload.sh"
+smoke_script = "run_qwen3_235b_shared.sh"
+workload_example = "examples/workloads/realistic.jsonl"
+
+[contract]
+model = "qwen3_235b_a22b"
+execution = "shared"
+request_shape = "single_llm"
+scenario = ""                     # 待导出完整原生 TOML，含模型、物理 GPU/TP/EP/拓扑。
+model_semantics_manifest = ""      # 模型尺寸、BF16存储、top-k及工作量规则。
+hardware_cost_manifest = ""        # 基础定价、容量、链路、启动等假设。
+metric_implementation = "scripts/results.py"
+required_validation_manifest = ""
+length_model = "known_trace"      # 当前假设，不代表未知输出长度服务。
+scheduler_cost = "zero_simulated_time" # 当前假设；新控制开销必须另作边界说明。
+
+[slo]
+# 未指定；类型占位不是合法运行数值，不能自动转换为默认目标。
+ttft_limit_s = "UNSET"
+tpot_limit_s = "UNSET"
+min_joint_pass_fraction = "UNSET"
+
+[cases]
+workload_manifest = ""            # 内容哈希、train/visible_validation/holdout、来源。
+arrival_rate_multipliers = []      # 冻结后只改到达间隔，不改请求内容。
+require_complete_requests = true
+holdout_mode = "none"             # 当前不声称有不可见数据；独立重放不是holdout。
+
+[routing]
+mode = "UNSET"                    # uniform_synthetic / skew_synthetic / replay，后两者待扩展。
+input_manifest = ""               # 固定有序top-k、种子/输入身份、来源和揭示协议。
+private_oracle_bundle = ""        # 仅可信driver/oracle读取，不挂任何agent或候选worker。
+reveal_at = "router_completion"   # 拟议；当前worker预生成全轮图，尚未提供此隔离。
+allow_policy_future_routes = false
+
+[baseline]
+mode = "local_sealed"
+bundle = ""                       # 尚未准备本设计契约的基线。
+require_exact_identity = true
+reuse_starts_new_run = true        # resume仅继续原研究账本。
+
+[candidate]
+reference_mechanism = ""           # 控制器冻结的源码身份。
+first_mechanism = "persistent_attention_placement"
+allow_mechanism_development = true
+patch_policy_manifest = ""        # 精确到模块/符号的机制范围，不能放开混合成本文件。
+trusted_files_manifest = ""       # 评分/成本/语义/可信检查/时间与资源不变量。
+policy_actions_existing = ["route", "batch", "submit_kv", "wait"]
+policy_actions_proposed = ["place_attention_group"]
+policy_parameter_bounds = ""      # 先冻结合法范围，不填未经确认的优化值。
+runtime_policy = "deterministic_native"
+
+[validation]
+protocol_manifest = ""            # 旧可信检查+原生义务检查+独立反例。
+required_controls = ["A", "B", "C", "D", "E"]
+independent_clean_replay = true
+validator_extension = "separate_review_and_counterexamples"
+unvalidated_assumptions = "exploratory_only"
+
+[search]
+inner = "policy"
+outer = "mechanism"
+seed = "UNSET"
+stop_on_stagnation = false
+budget_manifest = ""              # 控制器唯一账本；包括诊断、开发、失败、构建和复验。
+
+[budget]
+# 零表示禁止执行，均须在未来冻结前配置授权值。
+total_wall_seconds = 0
+max_attempts = 0
+per_trial_wall_seconds = 0
+diagnostic_wall_seconds = 0
+verification_wall_seconds = 0
+agent_calls = 0
+agent_tokens = 0
+agent_cost_limit = "UNSET"
+currency = "UNSET"
+
+[agent]
+frontend = "UNSET"
+model = "UNSET"                   # 不把被模拟的Qwen模型当研究agent模型。
+verifier_model = "UNSET"
+image_digest = ""                # 固定依赖/工具链身份；不能只凭可变tag复用。
+
+[container]
+research_network = "agent_api_only" # 设计目标；须真正实现出口限制。
+execution_network = "none"
+docker_socket = false
+cpus = 0
+memory_mib = 0
+pids_limit = 0
+parallel_trials = 0
+cleanup = "owned_resources_only"
+
+[artifacts]
+runs_root = "agents/qwen_moe_optimization/runs"
+time_directory = true
+result_jsonl = true
+metrics_json = true
+metrics_png = true
+throughput_png = true
+bounded_diagnostics = true
+diagnostic_limit_bytes = 0          # 待配置有界额度，不代表无限。
+reports = false
+full_graphs = false
+targeted_trace_selectors = []
+trace_limit_bytes = 0

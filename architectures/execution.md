@@ -23,6 +23,24 @@ and network nodes.
   costs across ranks; resident weights remain the full per-device amount.
 - Built-ins: `llama3_1`, `qwen3_moe`, `nemotron_h`.
 
+`qwen3_235b_a22b` is a fixed Qwen3 MoE preset. Its separate
+[`parameter file`](../crates/simthesizer-core/src/models/qwen3_235b_a22b.toml)
+pins the checkpoint source and defines 94 MoE blocks, 64/4 Q/KV heads of
+dimension 128, and 128 experts with top-8 routing and no shared expert.
+Select it without parameter overrides:
+
+```toml
+[system.model]
+kind = "qwen3_235b_a22b"
+```
+
+Custom dimensions still use `qwen3_moe`. Native profile-based runners use TP=1.
+Profile-based EP runners
+require a compatible Qwen3 performance profile; none is supplied for 235B.
+The fixed 235B preset additionally supports analytical shared Rooflang Attention
+TP1/2/4 with complete-expert EP1/2/4/8, where TP divides EP. Expert TP is 1.
+See [the shared contract](rooflang-shared.md) and `run_qwen3_235b_shared.sh`.
+
 Llama TP partitions query heads evenly. KV heads partition when there are at
 least as many heads as ranks; otherwise each rank holds one replicated KV head.
 Invalid partitions are rejected. Projection shapes, weights, and KV memory use
@@ -30,8 +48,8 @@ the same per-rank head counts.
 
 ## Model Runner
 
-A runner owns exactly one parallelism axis, the device topology it registers
-in its network simulator, and its compute and network simulators.
+A runner owns its parallel layout, device topology, and compute and network
+simulators.
 
 - **`ring`** is tensor parallelism. Each all-reduce marker becomes a ring
   all-reduce: `2(tp − 1)` steps, each of `tp` concurrent transfers carrying
@@ -41,7 +59,9 @@ in its network simulator, and its compute and network simulators.
   layer becomes routing, an all-to-all dispatch, one compute node per rank, a
   barrier, and an all-to-all combine. It rejects all-reduce markers.
 
-Pipeline parallelism and combined TP×EP are not modeled.
+These profile-based runners do not combine TP and EP. Shared Rooflang Qwen
+groups Attention TP ranks inside a shared EP pool; its explicit graph models
+each collective. Pipeline parallelism is not modeled.
 
 For `moe_ep_multi_instance`, non-MoE layers run per rank on that rank's own
 batch. Ranks join at MoE collectives and block boundaries, then split again.

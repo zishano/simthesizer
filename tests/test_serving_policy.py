@@ -33,6 +33,43 @@ def policy(kind):
 class ServingPolicyTests(unittest.TestCase):
     run_case = shared.SharedExecutionTests.run_case
 
+    def test_lazy_observations_and_bounded_diagnostics_preserve_execution(self):
+        results = []
+        for capture in (False, True):
+            settings = policy("candidate")
+            if capture:
+                settings["diagnostics"] = {"max_samples": 4, "every_decisions": 7}
+            root, result = self.run_case(
+                f"observations-{capture}",
+                p=2,
+                d=1,
+                count=2,
+                outputs=3,
+                budget=3,
+                slow=True,
+                handoff="layer",
+                trace=True,
+                policy_stats=True,
+                mutate=lambda system, settings=settings: system.update(policy=settings),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_causal_trace(root)
+            stats = json.loads((root / "policy-stats.json").read_text())
+            if capture:
+                self.assertEqual(
+                    [s["decision"] for s in stats["samples"]], [0, 7, 14, 21]
+                )
+                self.assertTrue(any(s["memory"] for s in stats["samples"]))
+            else:
+                self.assertNotIn("samples", stats)
+            results.append(
+                tuple(
+                    (root / name).read_bytes()
+                    for name in ("result.jsonl", "outer.jsonl", "state.jsonl")
+                )
+            )
+        self.assertEqual(results[0], results[1])
+
     def assert_causal_trace(self, root):
         nodes, live, pending = {}, {}, {}
         active, inflight, prefill_done = set(), set(), set()

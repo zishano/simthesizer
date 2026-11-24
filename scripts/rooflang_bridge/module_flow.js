@@ -1,9 +1,9 @@
 // Indexed replay of existing observations. No simulated cost is recomputed here.
 const FLOW_LABELS = {
   arrivals:'请求到达', p_schedule:'P · 排队 / 调度', p_control:'P · 轮次控制',
-  p_compute:'P · 计算 / TP', p_kv:'P 端 KV', transfer:'KV 分片传输',
+  p_compute:'P · 计算 / 通信', p_kv:'P 端 KV', transfer:'KV 分片传输',
   d_schedule:'D · 排队 / 调度', d_control:'D · 轮次控制',
-  d_compute:'D · 计算 / TP', d_kv:'D 端 KV', complete:'完成 / 释放',
+  d_compute:'D · 计算 / 通信', d_kv:'D 端 KV', complete:'完成 / 释放',
   unassigned:'未归属逻辑'
 };
 
@@ -26,7 +26,7 @@ const FLOW_EVENTS = {
 
 function describeFlowEvent(n,byId) {
   const event=n.view.flow_event,known=FLOW_EVENTS[event];
-  let [label,meaning]=known||[n.view.name,n.view.category==='tp'?'执行本轮 TP 通信。':n.view.category==='operator'?'执行本轮算子，消耗计算 / HBM 资源。':'保留原生事件；具体作用见节点完整记录。'];
+  let [label,meaning]=known||[n.view.name,n.view.category==='tp'?'执行本轮组内通信（TP/EP）。':n.view.category==='operator'?'执行本轮算子，消耗计算 / HBM 资源。':'保留原生事件；具体作用见节点完整记录。'];
   if(event==='LlmSchedule'){
     const source=byId.get(n.cause)?.view.flow_event;
     meaning=(source==='LlmBatchComplete'?'上一批次完成后再次检查可运行请求。':source==='LlmEnqueue'?'请求入队后检查可运行请求。':meaning)+
@@ -190,7 +190,7 @@ function renderModules() {
       const q=s.queues[side];
       card.lines=[`队列 ${q?.waiting??'—'} · 已接纳 ${q?.admitted??'—'}`,`调度事件 ${group.done} / ${group.total}`];
       if(q?.waiting&&!card.pulse)card.state='waiting';
-      card.extra=data.instances.filter(i=>i.side===side).map(i=>`${i.id} · ${i.gpu_model} · TP=${i.tp}`).join('；');
+      card.extra=data.instances.filter(i=>i.side===side).map(i=>`${i.id} · ${i.gpu_model} · TP=${i.tp} · EP=${i.ep??1}`).join('；');
     }else if(key.endsWith('_control')){
       const r=s.rounds[side],wait=s.admission[side].active.size;
       card.lines=[summarizeRound(side),`完成 ${r.done}/${r.total} 轮 · 准入等待 ${wait}`];
@@ -199,7 +199,7 @@ function renderModules() {
     }else if(key.endsWith('_compute')){
       const running=[...group.active],tp=running.filter(n=>n.view.category==='tp').length;
       const layers=[...new Set(running.map(n=>n.view.layer).filter(l=>l!==null))];
-      card.lines=[`运行 ${running.length} · TP ${tp}${layers.length?' · L'+layers.join('/'):''}`,`完成 ${group.done}/${group.total}${side==='d'&&s.kvWait.active.size?' · 等KV '+s.kvWait.active.size:''}`];
+      card.lines=[`运行 ${running.length} · 通信 ${tp}${layers.length?' · L'+layers.join('/'):''}`,`完成 ${group.done}/${group.total}${side==='d'&&s.kvWait.active.size?' · 等KV '+s.kvWait.active.size:''}`];
       card.extra=running.slice(0,8).map(n=>`#${n.id} ${n.view.instance} ${n.view.name}`).join('\n');
       if(!on&&side==='d'&&s.kvWait.active.size)card.state='waiting';
     }else if(key.endsWith('_kv')){

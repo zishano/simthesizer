@@ -74,14 +74,58 @@ pub struct PdDisaggregationSystem {
 
 /// Device and link indices refer to insertion order in the parent network simulator.
 #[derive(Deserialize, Serialize)]
+#[serde(try_from = "KvTopologyConfig")]
+pub struct KvTopology {
+    pub devices: Vec<String>,
+    links: Vec<KvLink>,
+    routes: Vec<KvRoute>,
+    pub shards: u32,
+    /// Replica -> attention group -> physical device. A request selects one group.
+    pub prefill_groups: Vec<Vec<Vec<usize>>>,
+    pub decode_groups: Vec<Vec<Vec<usize>>>,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KvTopology {
+struct KvTopologyConfig {
     devices: Vec<String>,
     links: Vec<KvLink>,
     routes: Vec<KvRoute>,
     shards: u32,
-    prefill_gpus: Vec<Vec<usize>>,
-    decode_gpus: Vec<Vec<usize>>,
+    prefill_groups: Option<Vec<Vec<Vec<usize>>>>,
+    decode_groups: Option<Vec<Vec<Vec<usize>>>>,
+    // Legacy input only; the runtime has one representation.
+    prefill_gpus: Option<Vec<Vec<usize>>>,
+    decode_gpus: Option<Vec<Vec<usize>>>,
+    attention_dp: Option<bool>,
+}
+
+impl TryFrom<KvTopologyConfig> for KvTopology {
+    type Error = anyhow::Error;
+
+    fn try_from(config: KvTopologyConfig) -> Result<Self> {
+        let normalize = |groups: Option<Vec<Vec<Vec<usize>>>>, old: Option<Vec<Vec<usize>>>| {
+            match (groups, old) {
+                (Some(groups), None) if config.attention_dp.is_none() => Ok(groups),
+                (None, Some(old)) => Ok(old.into_iter().map(|replica| {
+                    if config.attention_dp.unwrap_or(false) {
+                        replica.into_iter().map(|rank| vec![rank]).collect()
+                    } else {
+                        vec![replica]
+                    }
+                }).collect()),
+                _ => bail!("KV topology requires either explicit attention groups or legacy GPU groups, without mixing schemas"),
+            }
+        };
+        Ok(Self {
+            devices: config.devices,
+            links: config.links,
+            routes: config.routes,
+            shards: config.shards,
+            prefill_groups: normalize(config.prefill_groups, config.prefill_gpus)?,
+            decode_groups: normalize(config.decode_groups, config.decode_gpus)?,
+        })
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -107,7 +151,7 @@ struct KvRoute {
 
 impl KvTopology {
     fn validate(&self, p: usize, d: usize, allow_gpu_sharing: bool) -> Result<()> {
-        if self.shards == 0 || self.prefill_gpus.len() != p || self.decode_gpus.len() != d {
+        if self.shards == 0 || self.prefill_groups.len() != p || self.decode_groups.len() != d {
             bail!("KV topology pool dimensions or shard count invalid");
         }
         let mut names = HashSet::new();
@@ -119,17 +163,29 @@ impl KvTopology {
             bail!("KV topology device names must be unique and nonempty");
         }
         let mut allocated = HashSet::new();
-        for group in self.prefill_gpus.iter().chain(&self.decode_gpus) {
+        for replica in self.prefill_groups.iter().chain(&self.decode_groups) {
             let mut local = HashSet::new();
-            if group.is_empty() || self.shards as usize % group.len() != 0 {
-                bail!("KV shards must divide evenly across each TP group");
+            if replica.is_empty() {
+                bail!("KV replica must contain an attention group");
             }
-            for &gpu in group {
-                if gpu >= self.devices.len()
-                    || !local.insert(gpu)
-                    || (!allocated.insert(gpu) && !allow_gpu_sharing)
-                {
-                    bail!("KV topology allocations must be disjoint valid device IDs");
+            let width = replica[0].len();
+            if width == 0
+                || self.shards as usize % width != 0
+                || replica.iter().any(|group| group.len() != width)
+            {
+                bail!("KV shards must divide evenly across equal-width attention groups");
+            }
+            if replica.len() > 1 && !matches!(replica.len() * width, 1 | 2 | 4 | 8) {
+                bail!("attention-DP requires EP 1, 2, 4 or 8");
+            }
+            for group in replica {
+                for &gpu in group {
+                    if gpu >= self.devices.len()
+                        || !local.insert(gpu)
+                        || (!allocated.insert(gpu) && !allow_gpu_sharing)
+                    {
+                        bail!("KV topology allocations must be disjoint valid device IDs");
+                    }
                 }
             }
         }
@@ -150,8 +206,8 @@ impl KvTopology {
                 bail!("KV topology route endpoints invalid or duplicated");
             }
         }
-        for &src in self.prefill_gpus.iter().flatten() {
-            for &dst in self.decode_gpus.iter().flatten() {
+        for &src in self.prefill_groups.iter().flatten().flatten() {
+            for &dst in self.decode_groups.iter().flatten().flatten() {
                 if !pairs.contains(&(src, dst)) {
                     bail!("missing KV topology route");
                 }
@@ -160,9 +216,20 @@ impl KvTopology {
         Ok(())
     }
 
-    fn slices(&self, prefill: usize, decode: usize) -> Vec<(usize, usize, u32, u32)> {
-        let source = &self.prefill_gpus[prefill];
-        let target = &self.decode_gpus[decode];
+    fn has_attention_dp(&self) -> bool {
+        self.prefill_groups
+            .iter()
+            .chain(&self.decode_groups)
+            .any(|replica| replica.len() > 1)
+    }
+
+    fn request_devices<'a>(&self, replica: &'a [Vec<usize>], request: u64) -> &'a [usize] {
+        &replica[(request % replica.len() as u64) as usize]
+    }
+
+    fn slices(&self, prefill: usize, decode: usize, request: u64) -> Vec<(usize, usize, u32, u32)> {
+        let source = self.request_devices(&self.prefill_groups[prefill], request);
+        let target = self.request_devices(&self.decode_groups[decode], request);
         let source_width = self.shards / source.len() as u32;
         let target_width = self.shards / target.len() as u32;
         let mut slices = Vec::new();
@@ -546,7 +613,7 @@ impl PdDisaggregationSystem {
                     LogicalPayload::TransferComplete { request_id },
                 );
                 if let Some(topology) = &self.kv_topology {
-                    let slices = topology.slices(prefill_instance, decode_instance);
+                    let slices = topology.slices(prefill_instance, decode_instance, request_id);
                     let bytes_per_head =
                         self.model.kv_bytes_per_token_per_device() / u64::from(topology.shards);
                     for (src, dst, head_start, head_end) in slices {
@@ -707,6 +774,10 @@ impl LogicalHandler for PdDisaggregationSystem {
                         .collect::<Vec<_>>();
                     let (input_tokens, _) = Self::single_llm_tokens(&incoming.request)?;
                     Some(policy.borrow_mut().route(&RouteObservation {
+                        environment: Some(crate::policies::EnvironmentObservation::new(
+                            &graph.resources,
+                            &graph.kv,
+                        )),
                         now,
                         request_id,
                         input_tokens,
@@ -801,6 +872,14 @@ impl System for PdDisaggregationSystem {
             "GPU sharing requires shared execution"
         );
         anyhow::ensure!(
+            !self
+                .kv_topology
+                .as_ref()
+                .is_some_and(KvTopology::has_attention_dp)
+                || self.shared_execution,
+            "attention-DP KV placement requires shared execution"
+        );
+        anyhow::ensure!(
             matches!(self.kv_handoff.as_str(), "layer" | "whole"),
             "kv_handoff must be layer or whole"
         );
@@ -868,6 +947,16 @@ impl System for PdDisaggregationSystem {
             )?;
             if self.model.kv_bytes_per_token_per_device() % u64::from(topology.shards) != 0 {
                 bail!("KV bytes must divide evenly into shards");
+            }
+            if topology.has_attention_dp() {
+                anyhow::ensure!(
+                    self.model.block_layers().iter().any(|layer| matches!(
+                        layer,
+                        crate::types::Layer::Attention { num_kv_heads, .. }
+                            if *num_kv_heads == u64::from(topology.shards)
+                    )),
+                    "attention-DP KV shards must match the model's complete KV heads"
+                );
             }
             for index in 0..topology.devices.len() {
                 if self.network_sim.add_device() != index as u64 {
@@ -1011,7 +1100,9 @@ impl PdDisaggregationSystem {
             let topology = self.kv_topology.as_ref().unwrap();
             let mut routes = Vec::new();
             if let Some(decode) = decode {
-                for (src, dst, head_start, head_end) in topology.slices(prefill_instance, decode) {
+                for (src, dst, head_start, head_end) in
+                    topology.slices(prefill_instance, decode, request_id)
+                {
                     let path = topology
                         .routes
                         .iter()
@@ -1044,13 +1135,15 @@ impl PdDisaggregationSystem {
             graph.kv.plans.insert(
                 request_id,
                 crate::kv::Plan {
-                    source: topology.prefill_gpus[prefill_instance]
+                    source: topology
+                        .request_devices(&topology.prefill_groups[prefill_instance], request_id)
                         .iter()
                         .map(|&i| topology.devices[i].clone())
                         .collect(),
                     target: decode
                         .map(|d| {
-                            topology.decode_gpus[d]
+                            topology
+                                .request_devices(&topology.decode_groups[d], request_id)
                                 .iter()
                                 .map(|&i| topology.devices[i].clone())
                                 .collect()
@@ -1221,6 +1314,222 @@ mod tests {
         }
     }
 
+    fn ep_topology(p: usize, d: usize) -> KvTopology {
+        KvTopology {
+            devices: (0..p)
+                .map(|i| format!("p{i}"))
+                .chain((0..d).map(|i| format!("d{i}")))
+                .collect(),
+            shards: 4,
+            prefill_groups: vec![(0..p).map(|rank| vec![rank]).collect()],
+            decode_groups: vec![(p..p + d).map(|rank| vec![rank]).collect()],
+            links: (0..p * d)
+                .map(|i| KvLink {
+                    resource: Some(format!("fabric{i}")),
+                    src: i / d,
+                    dst: p + i % d,
+                    bandwidth: 1e9,
+                    latency: 1e-6,
+                })
+                .collect(),
+            routes: (0..p * d)
+                .map(|i| KvRoute {
+                    src: i / d,
+                    dst: p + i % d,
+                    links: vec![i],
+                })
+                .collect(),
+        }
+    }
+
+    fn ep_system(p: usize, d: usize) -> Box<PdDisaggregationSystem> {
+        let mut system: PdDisaggregationSystem = serde_json::from_value(serde_json::json!({
+            "shared_execution": true, "prefill_instances": [], "decode_instances": [],
+            "model": {"kind": "qwen3_235b_a22b"}, "tp": 1,
+            "network_sim": {"kind": "flow"}, "kv_topology": ep_topology(p, d),
+        }))
+        .unwrap();
+        let child = || {
+            Box::new(RouteChild {
+                index: 0,
+                assignments: Assignments::default(),
+                queued: HashMap::new(),
+            }) as Box<dyn System>
+        };
+        system.prefill_instances.push(child());
+        system.decode_instances.push(child());
+        Box::new(system)
+    }
+
+    fn ep_request(id: u64, output: u32) -> Request {
+        Request {
+            request_id: id,
+            arrival_time: 0.0,
+            initial: vec![0],
+            sub_requests: vec![SubRequest::Llm {
+                input_tokens: 5,
+                output_tokens: output,
+                known_tokens: None,
+                kv_tokens: None,
+                next: vec![],
+                interval: None,
+                model: None,
+                input_token_ids: None,
+                output_token_ids: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn attention_dp_uses_request_owners_without_splitting_four_heads_over_ep8() {
+        for (p, d) in [(8, 2), (4, 8), (1, 8)] {
+            let topology = ep_topology(p, d);
+            topology.validate(1, 1, false).unwrap();
+            for id in [0, 1, 7, 8, 9, u64::MAX] {
+                assert_eq!(
+                    topology.slices(0, 0, id),
+                    vec![((id % p as u64) as usize, p + (id % d as u64) as usize, 0, 4,)]
+                );
+            }
+        }
+        let mut incompatible = ep_topology(8, 2);
+        incompatible.prefill_groups = vec![vec![(0..8).collect()]];
+        assert!(incompatible.validate(1, 1, false).is_err());
+        let mut old = serde_json::to_value(ep_topology(2, 4)).unwrap();
+        old.as_object_mut().unwrap().remove("prefill_groups");
+        old.as_object_mut().unwrap().remove("decode_groups");
+        old["prefill_gpus"] = serde_json::json!([[0, 1]]);
+        old["decode_gpus"] = serde_json::json!([[2, 3, 4, 5]]);
+        let old: KvTopology = serde_json::from_value(old).unwrap();
+        assert!(!old.has_attention_dp());
+        old.validate(1, 1, false).unwrap();
+        assert_eq!(
+            old.slices(0, 0, 99),
+            vec![(0, 2, 0, 1), (0, 3, 1, 2), (1, 4, 2, 3), (1, 5, 3, 4)]
+        );
+        assert!(ep_topology(3, 8).validate(1, 1, false).is_err());
+    }
+
+    #[test]
+    fn explicit_attention_groups_reshard_all_four_heads_across_unequal_tp() {
+        let mut topology = ep_topology(8, 8);
+        topology.prefill_groups = vec![vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]];
+        topology.decode_groups = vec![vec![vec![8, 9, 10, 11], vec![12, 13, 14, 15]]];
+        topology.validate(1, 1, false).unwrap();
+        assert_eq!(
+            topology.slices(0, 0, 7),
+            vec![(6, 12, 0, 1), (6, 13, 1, 2), (7, 14, 2, 3), (7, 15, 3, 4),]
+        );
+        assert_eq!(
+            topology.request_devices(&topology.prefill_groups[0], 4),
+            &[0, 1]
+        );
+        let mut system = ep_system(8, 8);
+        system.kv_topology = Some(topology);
+        system.init().unwrap();
+        let mut graph = Graph::new();
+        system
+            .enroll_request(ep_request(7, 3), &mut graph, None, None, None)
+            .unwrap();
+        let plan = &graph.kv.plans[&7];
+        assert_eq!(plan.source, ["p6", "p7"]);
+        assert_eq!(plan.target, ["d4", "d5", "d6", "d7"]);
+        let reservations = graph.kv.reservations(7, true).unwrap();
+        assert_eq!(
+            reservations[0].bytes.values().copied().collect::<Vec<_>>(),
+            vec![481_280; 2]
+        );
+        assert_eq!(
+            reservations[1].bytes.values().copied().collect::<Vec<_>>(),
+            vec![336_896; 4]
+        );
+    }
+
+    #[test]
+    fn legacy_layout_normalizes_once_and_rejects_mixed_or_duplicate_groups() {
+        let mut old = serde_json::to_value(ep_topology(8, 8)).unwrap();
+        old.as_object_mut().unwrap().remove("prefill_groups");
+        old.as_object_mut().unwrap().remove("decode_groups");
+        old["prefill_gpus"] = serde_json::json!([(0..8).collect::<Vec<_>>()]);
+        old["decode_gpus"] = serde_json::json!([(8..16).collect::<Vec<_>>()]);
+        old["attention_dp"] = serde_json::json!(true);
+        let normalized: KvTopology = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(normalized.slices(0, 0, 7), vec![(7, 15, 0, 4)]);
+        let encoded = serde_json::to_value(normalized).unwrap();
+        assert!(encoded.get("attention_dp").is_none());
+        assert!(encoded.get("prefill_gpus").is_none());
+        old["prefill_groups"] = serde_json::json!([[[0]]]);
+        assert!(serde_json::from_value::<KvTopology>(old).is_err());
+        for groups in [
+            vec![],
+            vec![vec![]],
+            vec![vec![0, 0]],
+            vec![vec![0], vec![1, 2]],
+        ] {
+            let mut invalid = ep_topology(8, 8);
+            invalid.prefill_groups = vec![groups];
+            assert!(invalid.validate(1, 1, true).is_err());
+        }
+    }
+
+    #[test]
+    fn enrolling_unequal_ep_preserves_full_native_kv_reservations_and_optional_decode() {
+        for (p, d) in [(8, 2), (4, 8)] {
+            let mut system = ep_system(p, d);
+            system.init().unwrap();
+            let mut graph = Graph::new();
+            for (id, output) in [(7, 3), (8, 1), (9, 0)] {
+                system
+                    .enroll_request(ep_request(id, output), &mut graph, None, None, None)
+                    .unwrap();
+                let plan = &graph.kv.plans[&id];
+                let source = format!("p{}", id % p as u64);
+                let target = format!("d{}", id % d as u64);
+                assert_eq!(plan.source, vec![source.clone()]);
+                assert_eq!(
+                    (plan.layers, plan.heads, plan.bytes_per_token_head_layer),
+                    (94, 4, 512)
+                );
+                let reservations = graph.kv.reservations(id, true).unwrap();
+                assert_eq!(reservations[0].bytes.len(), 1);
+                assert_eq!(reservations[0].bytes[&source], 5 * 192_512);
+                if output > 1 {
+                    assert_eq!(plan.target, vec![target.clone()]);
+                    assert_eq!(plan.routes.len(), 1);
+                    let route = &plan.routes[0];
+                    assert_eq!(
+                        (&route.src, &route.dst, route.head_start, route.head_end),
+                        (&source, &target, 0, 4)
+                    );
+                    assert_eq!(reservations.len(), 2);
+                    assert_eq!(reservations[1].bytes.len(), 1);
+                    assert_eq!(reservations[1].bytes[&target], 7 * 192_512);
+                } else {
+                    assert!(plan.target.is_empty() && plan.routes.is_empty());
+                    assert_eq!(reservations.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_dp_rejects_exclusive_execution_and_incomplete_head_metadata() {
+        let mut system = ep_system(8, 8);
+        system.shared_execution = false;
+        assert!(system
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("attention-DP KV placement requires shared"));
+        let mut system = ep_system(8, 8);
+        system.kv_topology.as_mut().unwrap().shards = 2;
+        assert!(system
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("complete KV heads"));
+    }
+
     fn routed_run(future_arrival: f64) -> Vec<(u64, usize, f64)> {
         let assignments = Assignments::default();
         let children = || {
@@ -1248,8 +1557,8 @@ mod tests {
             kv_topology: Some(KvTopology {
                 devices: vec!["p0".into(), "p1".into(), "d0".into(), "d1".into()],
                 shards: 1,
-                prefill_gpus: vec![vec![0], vec![1]],
-                decode_gpus: vec![vec![2], vec![3]],
+                prefill_groups: vec![vec![vec![0]], vec![vec![1]]],
+                decode_groups: vec![vec![vec![2]], vec![vec![3]]],
                 links: (0..4)
                     .map(|i| KvLink {
                         resource: Some(format!("link{i}")),

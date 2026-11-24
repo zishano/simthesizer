@@ -37,22 +37,69 @@ pub struct Engine {
 
 struct Node {
     kind: NodeKind,
-    children: Vec<NodeID>,
+    children: Children,
     indegree: usize,
     start_time: f64,
 }
 
+// Most execution nodes release at most three children. Keep those edges beside
+// the node; larger fan-outs retain an ordinary vector and insertion order.
+#[derive(Default)]
+enum Children {
+    #[default]
+    Empty,
+    One(NodeID),
+    Two([NodeID; 2]),
+    Three([NodeID; 3]),
+    Many(Vec<NodeID>),
+}
+
+impl Children {
+    fn push(&mut self, child: NodeID) {
+        *self = match self {
+            Self::Empty => Self::One(child),
+            Self::One(a) => Self::Two([*a, child]),
+            Self::Two([a, b]) => Self::Three([*a, *b, child]),
+            Self::Three([a, b, c]) => Self::Many(vec![*a, *b, *c, child]),
+            Self::Many(children) => {
+                children.push(child);
+                return;
+            }
+        };
+    }
+
+    fn as_slice(&self) -> &[NodeID] {
+        match self {
+            Self::Empty => &[],
+            Self::One(child) => std::slice::from_ref(child),
+            Self::Two(children) => children,
+            Self::Three(children) => children,
+            Self::Many(children) => children,
+        }
+    }
+
+    fn into_vec(self) -> Vec<NodeID> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(child) => vec![child],
+            Self::Two(children) => Vec::from(children),
+            Self::Three(children) => Vec::from(children),
+            Self::Many(children) => children,
+        }
+    }
+}
+
 enum NodeKind {
     /// A real external condition, released only by its owning component.
-    Condition {
-        held: bool,
+    Condition { held: bool },
+    Resource {
+        work: Option<crate::resources::SharedWork>,
+        reserves_memory: bool,
+        releases_memory: bool,
     },
-    Resource(crate::resources::Work),
     Compute {
         simulator: *mut dyn ComputeSimulator,
-        layer: Layer,
-        batch: Vec<RequestState>,
-        context: ComputeContext,
+        payload: Box<ComputePayload>,
     },
     Network {
         simulator: *mut dyn NetworkSimulator,
@@ -67,19 +114,16 @@ enum NodeKind {
     },
 }
 
+struct ComputePayload {
+    layer: Layer,
+    batch: Vec<RequestState>,
+    context: ComputeContext,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QueueEntry {
     time: f64,
     node_id: NodeID,
-}
-
-#[derive(Clone, Copy)]
-enum EntryKind {
-    Condition,
-    Resource,
-    Compute,
-    Network,
-    Logical,
 }
 
 impl Default for Graph {
@@ -163,16 +207,32 @@ impl Graph {
         self.insert_node(
             NodeKind::Compute {
                 simulator,
-                layer,
-                batch,
-                context,
+                payload: Box::new(ComputePayload {
+                    layer,
+                    batch,
+                    context,
+                }),
             },
             0.0,
         )
     }
 
     pub fn add_resource_node(&mut self, work: crate::resources::Work) -> NodeID {
-        self.insert_node(NodeKind::Resource(work), 0.0)
+        self.add_shared_resource_node(crate::resources::SharedWork::new(work))
+    }
+
+    pub(crate) fn add_shared_resource_node(
+        &mut self,
+        work: crate::resources::SharedWork,
+    ) -> NodeID {
+        self.insert_node(
+            NodeKind::Resource {
+                reserves_memory: !work.reserve.is_empty(),
+                releases_memory: !work.release.is_empty(),
+                work: Some(work),
+            },
+            0.0,
+        )
     }
 
     pub fn is_pending(&self, node: NodeID) -> bool {
@@ -264,17 +324,20 @@ impl Graph {
     }
 
     pub fn add_edge(&mut self, parent: NodeID, child: NodeID) -> Result<()> {
-        self.ensure_node_exists(parent)?;
-        self.ensure_node_exists(child)?;
-        self.nodes
-            .get_mut(&parent)
-            .ok_or_else(|| anyhow!("node {parent} disappeared during edge insertion"))?
-            .children
-            .push(child);
-        self.nodes
-            .get_mut(&child)
-            .ok_or_else(|| anyhow!("node {child} disappeared during edge insertion"))?
-            .indegree += 1;
+        if parent == child {
+            let node = self
+                .nodes
+                .get_mut(&parent)
+                .ok_or_else(|| anyhow!("node {parent} does not exist"))?;
+            node.children.push(child);
+            node.indegree += 1;
+        } else {
+            let [parent_node, child_node] = self.nodes.get_disjoint_mut([&parent, &child]);
+            let parent_node = parent_node.ok_or_else(|| anyhow!("node {parent} does not exist"))?;
+            let child_node = child_node.ok_or_else(|| anyhow!("node {child} does not exist"))?;
+            parent_node.children.push(child);
+            child_node.indegree += 1;
+        }
         if self.trace.is_some() {
             self.record(json!({"event":"edge_add", "parent":parent, "child":child}));
         }
@@ -282,12 +345,11 @@ impl Graph {
     }
 
     pub fn pop_edges(&mut self, parent: NodeID) -> Result<Vec<NodeID>> {
-        self.ensure_node_exists(parent)?;
         let parent_node = self
             .nodes
             .get_mut(&parent)
-            .ok_or_else(|| anyhow!("node {parent} disappeared during edge removal"))?;
-        let children = std::mem::take(&mut parent_node.children);
+            .ok_or_else(|| anyhow!("node {parent} does not exist"))?;
+        let children = std::mem::take(&mut parent_node.children).into_vec();
 
         for &child_id in &children {
             let child = self
@@ -308,19 +370,15 @@ impl Graph {
         Ok(children)
     }
 
-    fn remove_completed_node(&mut self, node_id: NodeID) -> Result<()> {
-        let indegree = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| anyhow!("node {node_id} does not exist"))?
-            .indegree;
+    fn take_completed_node(&mut self, node_id: NodeID) -> Result<Node> {
+        let std::collections::hash_map::Entry::Occupied(entry) = self.nodes.entry(node_id) else {
+            bail!("node {node_id} does not exist");
+        };
+        let indegree = entry.get().indegree;
         if indegree != 0 {
             bail!("node {node_id} is not completed: indegree is {indegree}");
         }
-        self.nodes
-            .remove(&node_id)
-            .ok_or_else(|| anyhow!("node {node_id} disappeared during removal"))?;
-        Ok(())
+        Ok(entry.remove())
     }
 
     fn insert_node(&mut self, kind: NodeKind, start_time: f64) -> NodeID {
@@ -331,18 +389,21 @@ impl Graph {
                 NodeKind::Condition { held } => {
                     json!({"kind":"logical", "label":"KV ready condition", "held":held})
                 }
-                NodeKind::Resource(work) => {
+                NodeKind::Resource { work, .. } => {
+                    let work = work.as_ref().unwrap();
                     json!({"kind":"resource", "label":work.details.get("name").and_then(Value::as_str).unwrap_or("resource"), "work":work})
                 }
-                NodeKind::Compute {
-                    layer,
-                    batch,
-                    context,
-                    ..
-                } => json!({
+                NodeKind::Compute { payload, .. } => {
+                    let ComputePayload {
+                        layer,
+                        batch,
+                        context,
+                    } = payload.as_ref();
+                    json!({
                     "kind":"compute", "label":layer.name(), "layer":format!("{layer:?}"),
                     "batch":batch.iter().map(|r| json!({"q_len":r.q_len,"kv_len":r.kv_len,"lm_head_len":r.lm_head_len})).collect::<Vec<_>>(),
-                    "context":format!("{context:?}")}),
+                    "context":format!("{context:?}")})
+                }
                 NodeKind::Network {
                     src, dst, bytes, ..
                 } => {
@@ -361,19 +422,12 @@ impl Graph {
             node_id,
             Node {
                 kind,
-                children: Vec::new(),
+                children: Children::default(),
                 indegree: 0,
                 start_time,
             },
         );
         node_id
-    }
-
-    fn ensure_node_exists(&self, node_id: NodeID) -> Result<()> {
-        if self.nodes.contains_key(&node_id) {
-            return Ok(());
-        }
-        bail!("node {node_id} does not exist")
     }
 }
 
@@ -403,20 +457,33 @@ impl Engine {
         Vec<RequestResult>,
         Option<crate::policies::PolicyStatistics>,
     )> {
+        use crate::wall_profile::{scope, Section};
+        let _wall = scope(Section::EngineOther);
         self.graph.check_trace(false)?;
         let mut queue = self.ready_queue()?;
         let mut last_observed = None;
         loop {
-            for id in self.graph.resources.admit(self.graph.clock)? {
-                self.graph
-                    .record(json!({"event":"resource_start", "node":id}));
-                if let NodeKind::Resource(work) = &self.graph.nodes[&id].kind {
-                    if !work.reserve.is_empty() {
+            let admitted = {
+                let _wall = scope(Section::ResourceAdmit);
+                self.graph.resources.admit(self.graph.clock)?
+            };
+            if self.graph.tracing_enabled() {
+                for id in admitted {
+                    self.graph
+                        .record(json!({"event":"resource_start", "node":id}));
+                    if let NodeKind::Resource {
+                        reserves_memory: true,
+                        ..
+                    } = &self.graph.nodes[&id].kind
+                    {
                         self.graph.record_memory();
                     }
                 }
             }
-            let next_resource = self.graph.resources.next_time();
+            let next_resource = {
+                let _wall = scope(Section::ResourceRates);
+                self.graph.resources.next_time()
+            };
             let next_queue = queue.peek().map(|entry| entry.time);
             let time = match (next_resource, next_queue) {
                 (Some(a), Some(b)) => a.min(b),
@@ -428,12 +495,21 @@ impl Engine {
                 last_observed = Some(self.graph.clock);
             }
             self.graph.clock = time;
-            let finished = self.graph.resources.advance(time)?;
+            let finished = {
+                let _wall = scope(Section::ResourceAdvance);
+                self.graph.resources.advance(time)?
+            };
             for (id, start) in finished {
-                if let NodeKind::Resource(work) = &self.graph.nodes[&id].kind {
-                    if !work.release.is_empty() {
-                        self.graph.record_memory();
-                    }
+                if self.graph.tracing_enabled()
+                    && matches!(
+                        self.graph.nodes[&id].kind,
+                        NodeKind::Resource {
+                            releases_memory: true,
+                            ..
+                        }
+                    )
+                {
+                    self.graph.record_memory();
                 }
                 self.complete_node(id, start, time - start, &mut queue)?;
             }
@@ -448,7 +524,10 @@ impl Engine {
                 self.graph
                     .record(json!({"event":"dispatch", "node":entry.node_id}));
             }
-            self.process_entry(entry, &mut queue)?;
+            {
+                let _wall = scope(Section::EventDispatch);
+                self.process_entry(entry, &mut queue)?;
+            }
             self.graph.current = None;
             self.graph.check_trace(false)?;
         }
@@ -499,39 +578,23 @@ impl Engine {
         entry: QueueEntry,
         queue: &mut BinaryHeap<QueueEntry>,
     ) -> Result<()> {
-        match self.entry_kind(entry.node_id)? {
-            EntryKind::Condition => {
-                let NodeKind::Condition { held } = self.graph.nodes[&entry.node_id].kind else {
-                    unreachable!()
-                };
-                anyhow::ensure!(!held, "unreleased condition was scheduled");
-                self.complete_node(entry.node_id, entry.time, 0.0, queue)
-            }
-            EntryKind::Resource => {
-                let node = self.graph.nodes.get(&entry.node_id).unwrap();
-                let NodeKind::Resource(work) = &node.kind else {
-                    unreachable!()
-                };
-                self.graph.resources.submit(entry.node_id, work.clone())
-            }
-            EntryKind::Compute => self.process_compute_node(entry, queue),
-            EntryKind::Network => self.process_network_node(entry, queue),
-            EntryKind::Logical => self.process_logical_node(entry, queue),
-        }
-    }
-
-    fn entry_kind(&self, node_id: NodeID) -> Result<EntryKind> {
         let node = self
             .graph
             .nodes
-            .get(&node_id)
-            .ok_or_else(|| anyhow!("queued node {node_id} is missing"))?;
-        match &node.kind {
-            NodeKind::Condition { .. } => Ok(EntryKind::Condition),
-            NodeKind::Resource(_) => Ok(EntryKind::Resource),
-            NodeKind::Compute { .. } => Ok(EntryKind::Compute),
-            NodeKind::Network { .. } => Ok(EntryKind::Network),
-            NodeKind::Logical { .. } => Ok(EntryKind::Logical),
+            .get_mut(&entry.node_id)
+            .ok_or_else(|| anyhow!("queued node {} is missing", entry.node_id))?;
+        match &mut node.kind {
+            NodeKind::Condition { held } => {
+                anyhow::ensure!(!*held, "unreleased condition was scheduled");
+                self.complete_node(entry.node_id, entry.time, 0.0, queue)
+            }
+            NodeKind::Resource { work, .. } => {
+                let work = work.take().context("resource work submitted twice")?;
+                self.graph.resources.submit_shared(entry.node_id, work)
+            }
+            NodeKind::Compute { .. } => self.process_compute_node(entry, queue),
+            NodeKind::Network { .. } => self.process_network_node(entry, queue),
+            NodeKind::Logical { .. } => self.process_logical_node(entry, queue),
         }
     }
 
@@ -546,15 +609,14 @@ impl Engine {
                 .nodes
                 .get(&entry.node_id)
                 .ok_or_else(|| anyhow!("queued node {} is missing", entry.node_id))?;
-            let NodeKind::Compute {
-                simulator,
+            let NodeKind::Compute { simulator, payload } = &node.kind else {
+                bail!("node {} is not a compute node", entry.node_id);
+            };
+            let ComputePayload {
                 layer,
                 batch,
                 context,
-            } = &node.kind
-            else {
-                bail!("node {} is not a compute node", entry.node_id);
-            };
+            } = payload.as_ref();
             let latency = unsafe {
                 // NOTE: Safety: compute nodes store simulator pointers to stable system-owned
                 // allocations. Engine execution is single-threaded, so these shared calls do not
@@ -676,14 +738,9 @@ impl Engine {
         if self.graph.trace.is_some() {
             self.graph.record(json!({"event":"node_complete", "node":node_id, "start_s":start_time, "finish_s":finish_time}));
         }
-        let children = self
-            .graph
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| anyhow!("completed node {node_id} is missing"))?
-            .children
-            .to_vec();
-        for child_id in children {
+        let mut node = self.graph.take_completed_node(node_id)?;
+        let children = std::mem::take(&mut node.children);
+        for &child_id in children.as_slice() {
             let child = self
                 .graph
                 .nodes
@@ -707,7 +764,7 @@ impl Engine {
                 });
             }
         }
-        self.graph.remove_completed_node(node_id)?;
+        drop(node);
         Ok(())
     }
 }
@@ -731,6 +788,82 @@ impl Ord for QueueEntry {
         match other.time.total_cmp(&self.time) {
             Ordering::Equal => other.node_id.cmp(&self.node_id),
             ordering => ordering,
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn missing_edge_endpoint_does_not_mutate_the_other_endpoint() {
+        let mut graph = Graph::new();
+        let node = graph.add_resource_node(Default::default());
+        assert!(graph.add_edge(node, 99).is_err());
+        assert!(graph.add_edge(99, node).is_err());
+        assert!(graph.add_edge(99, 99).is_err());
+        assert!(graph.nodes[&node].children.as_slice().is_empty());
+        assert_eq!(graph.nodes[&node].indegree, 0);
+    }
+
+    #[test]
+    fn self_edges_retain_cycle_and_pop_semantics() {
+        let mut graph = Graph::new();
+        let node = graph.add_resource_node(Default::default());
+        graph.add_edge(node, node).unwrap();
+        assert_eq!(graph.nodes[&node].children.as_slice(), &[node]);
+        assert_eq!(graph.nodes[&node].indegree, 1);
+        assert!(graph.take_completed_node(node).is_err());
+        assert!(graph.is_pending(node));
+        assert_eq!(graph.pop_edges(node).unwrap(), vec![node]);
+        assert_eq!(graph.nodes[&node].indegree, 0);
+        assert!(graph.nodes[&node].children.as_slice().is_empty());
+    }
+
+    #[test]
+    fn inline_and_spilled_edges_preserve_duplicates_and_pop_order() {
+        for count in 0..10 {
+            let mut graph = Graph::new();
+            let parent = graph.add_resource_node(Default::default());
+            let children = [
+                graph.add_resource_node(Default::default()),
+                graph.add_resource_node(Default::default()),
+            ];
+            let expected: Vec<_> = (0..count).map(|i| children[i % 2]).collect();
+            for &child in &expected {
+                graph.add_edge(parent, child).unwrap();
+            }
+            assert_eq!(graph.nodes[&parent].children.as_slice(), expected);
+            assert_eq!(
+                matches!(graph.nodes[&parent].children, Children::Many(_)),
+                count > 3
+            );
+            assert_eq!(graph.nodes[&children[0]].indegree, count.div_ceil(2));
+            assert_eq!(graph.nodes[&children[1]].indegree, count / 2);
+            assert_eq!(graph.pop_edges(parent).unwrap(), expected);
+            assert!(graph.nodes[&parent].children.as_slice().is_empty());
+            for child in children {
+                assert_eq!(graph.nodes[&child].indegree, 0);
+            }
+            graph.add_edge(parent, children[1]).unwrap();
+            assert_eq!(graph.pop_edges(parent).unwrap(), vec![children[1]]);
+        }
+    }
+
+    #[test]
+    fn missing_endpoint_preserves_inline_and_spilled_edges() {
+        for count in 0..6 {
+            let mut graph = Graph::new();
+            let parent = graph.add_resource_node(Default::default());
+            let child = graph.add_resource_node(Default::default());
+            for _ in 0..count {
+                graph.add_edge(parent, child).unwrap();
+            }
+            assert!(graph.add_edge(parent, 99).is_err());
+            assert!(graph.add_edge(99, child).is_err());
+            assert_eq!(graph.nodes[&parent].children.as_slice(), vec![child; count]);
+            assert_eq!(graph.nodes[&child].indegree, count);
         }
     }
 }
